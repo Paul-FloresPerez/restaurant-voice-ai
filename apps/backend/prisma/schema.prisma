@@ -1,8 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
   provider = "prisma-client"
   output   = "../generated/prisma"
@@ -10,4 +5,267 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model allergens {
+  id                  String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                String                @unique
+  menu_item_allergens menu_item_allergens[]
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model categories {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String       @unique
+  description String?
+  sort_order  Int          @default(0)
+  is_active   Boolean      @default(true)
+  created_at  DateTime     @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime     @default(now()) @db.Timestamptz(6)
+  menu_items  menu_items[]
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model ingredients {
+  id                    String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                  String                  @unique
+  menu_item_ingredients menu_item_ingredients[]
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model interaction_logs {
+  id         String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  session_id String           @db.Uuid
+  role       interaction_role
+  message    String
+  created_at DateTime         @default(now()) @db.Timestamptz(6)
+  sessions   sessions         @relation(fields: [session_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([session_id, created_at], map: "idx_interaction_logs_session_created")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model item_variant_modifier_groups {
+  variant_id         String             @db.Uuid
+  group_id           String             @db.Uuid
+  modifier_groups    modifier_groups    @relation(fields: [group_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  menu_item_variants menu_item_variants @relation(fields: [variant_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([variant_id, group_id])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model menu_item_allergens {
+  menu_item_id String     @db.Uuid
+  allergen_id  String     @db.Uuid
+  allergens    allergens  @relation(fields: [allergen_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  menu_items   menu_items @relation(fields: [menu_item_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([menu_item_id, allergen_id])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model menu_item_ingredients {
+  menu_item_id  String      @db.Uuid
+  ingredient_id String      @db.Uuid
+  ingredients   ingredients @relation(fields: [ingredient_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  menu_items    menu_items  @relation(fields: [menu_item_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([menu_item_id, ingredient_id])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model menu_item_variants {
+  id                           String                         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  menu_item_id                 String                         @db.Uuid
+  name                         String
+  sku                          String?                        @unique
+  price                        Decimal                        @db.Decimal(10, 2)
+  is_default                   Boolean                        @default(false)
+  is_available                 Boolean                        @default(true)
+  sort_order                   Int                            @default(0)
+  created_at                   DateTime                       @default(now()) @db.Timestamptz(6)
+  updated_at                   DateTime                       @default(now()) @db.Timestamptz(6)
+  item_variant_modifier_groups item_variant_modifier_groups[]
+  menu_items                   menu_items                     @relation(fields: [menu_item_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  order_items                  order_items[]
+
+  @@index([menu_item_id, is_available], map: "idx_menu_item_variants_item_available")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model menu_items {
+  id                    String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  category_id           String                  @db.Uuid
+  name                  String
+  description           String?
+  is_active             Boolean                 @default(true)
+  is_available          Boolean                 @default(true)
+  is_vegetarian         Boolean                 @default(false)
+  is_vegan              Boolean                 @default(false)
+  is_spicy              Boolean                 @default(false)
+  search_aliases        String[]                @default([])
+  sort_order            Int                     @default(0)
+  created_at            DateTime                @default(now()) @db.Timestamptz(6)
+  updated_at            DateTime                @default(now()) @db.Timestamptz(6)
+  menu_item_allergens   menu_item_allergens[]
+  menu_item_ingredients menu_item_ingredients[]
+  menu_item_variants    menu_item_variants[]
+  categories            categories              @relation(fields: [category_id], references: [id], onUpdate: NoAction)
+  order_items           order_items[]
+
+  @@unique([category_id, name])
+  @@index([category_id, is_available], map: "idx_menu_items_category_available")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model modifier_groups {
+  id                           String                         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                         String                         @unique
+  description                  String?
+  min_select                   Int                            @default(0)
+  max_select                   Int                            @default(1)
+  is_active                    Boolean                        @default(true)
+  sort_order                   Int                            @default(0)
+  created_at                   DateTime                       @default(now()) @db.Timestamptz(6)
+  updated_at                   DateTime                       @default(now()) @db.Timestamptz(6)
+  item_variant_modifier_groups item_variant_modifier_groups[]
+  modifier_options             modifier_options[]
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model modifier_options {
+  id                   String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  group_id             String                 @db.Uuid
+  name                 String
+  price_delta          Decimal                @default(0) @db.Decimal(10, 2)
+  is_available         Boolean                @default(true)
+  sort_order           Int                    @default(0)
+  created_at           DateTime               @default(now()) @db.Timestamptz(6)
+  updated_at           DateTime               @default(now()) @db.Timestamptz(6)
+  modifier_groups      modifier_groups        @relation(fields: [group_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  order_item_modifiers order_item_modifiers[]
+
+  @@unique([group_id, name])
+  @@index([group_id, is_available], map: "idx_modifier_options_group_available")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model order_events {
+  id         String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  order_id   String           @db.Uuid
+  type       order_event_type
+  payload    Json?
+  created_at DateTime         @default(now()) @db.Timestamptz(6)
+  orders     orders           @relation(fields: [order_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([order_id, created_at], map: "idx_order_events_order_created")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model order_item_modifiers {
+  id                   String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  order_item_id        String            @db.Uuid
+  modifier_option_id   String?           @db.Uuid
+  group_name_snapshot  String
+  option_name_snapshot String
+  price_delta_snapshot Decimal           @default(0) @db.Decimal(10, 2)
+  quantity             Int               @default(1)
+  modifier_options     modifier_options? @relation(fields: [modifier_option_id], references: [id], onUpdate: NoAction)
+  order_items          order_items       @relation(fields: [order_item_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([order_item_id], map: "idx_order_item_modifiers_order_item")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model order_items {
+  id                    String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  order_id              String                 @db.Uuid
+  variant_id            String                 @db.Uuid
+  menu_item_id          String                 @db.Uuid
+  item_name_snapshot    String
+  variant_name_snapshot String?
+  unit_price_snapshot   Decimal                @db.Decimal(10, 2)
+  quantity              Int                    @default(1)
+  special_instructions  String?
+  line_total            Decimal                @db.Decimal(10, 2)
+  created_at            DateTime               @default(now()) @db.Timestamptz(6)
+  updated_at            DateTime               @default(now()) @db.Timestamptz(6)
+  order_item_modifiers  order_item_modifiers[]
+  menu_items            menu_items             @relation(fields: [menu_item_id], references: [id], onUpdate: NoAction)
+  orders                orders                 @relation(fields: [order_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  menu_item_variants    menu_item_variants     @relation(fields: [variant_id], references: [id], onUpdate: NoAction)
+
+  @@index([order_id], map: "idx_order_items_order")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model orders {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  session_id     String         @db.Uuid
+  order_code     String?        @unique
+  status         order_status   @default(DRAFT)
+  subtotal       Decimal        @default(0) @db.Decimal(10, 2)
+  discount_total Decimal        @default(0) @db.Decimal(10, 2)
+  tax_total      Decimal        @default(0) @db.Decimal(10, 2)
+  total          Decimal        @default(0) @db.Decimal(10, 2)
+  notes          String?
+  confirmed_at   DateTime?      @db.Timestamptz(6)
+  cancelled_at   DateTime?      @db.Timestamptz(6)
+  created_at     DateTime       @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime       @default(now()) @db.Timestamptz(6)
+  order_events   order_events[]
+  order_items    order_items[]
+  sessions       sessions       @relation(fields: [session_id], references: [id], onUpdate: NoAction)
+
+  @@index([session_id, status], map: "idx_orders_session_status")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model sessions {
+  id                  String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  channel             String             @default("voice")
+  table_label         String?
+  device_code         String?
+  status              session_status     @default(ACTIVE)
+  last_interaction_at DateTime           @default(now()) @db.Timestamptz(6)
+  created_at          DateTime           @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime           @default(now()) @db.Timestamptz(6)
+  interaction_logs    interaction_logs[]
+  orders              orders[]
+
+  @@index([status], map: "idx_sessions_status")
+}
+
+enum interaction_role {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum order_event_type {
+  ADD_ITEM
+  UPDATE_ITEM
+  REMOVE_ITEM
+  CHANGE_MODIFIERS
+  ADD_NOTE
+  CLEAR_ORDER
+  CONFIRM_ORDER
+  CANCEL_ORDER
+}
+
+enum order_status {
+  DRAFT
+  CONFIRMED
+  IN_PREPARATION
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+enum session_status {
+  ACTIVE
+  CLOSED
+  EXPIRED
 }

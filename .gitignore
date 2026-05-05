@@ -32,4 +32,4 @@ apps/backend/prisma/dev.db-journal
 
 # Cache
 .cache/
-.turbo/
+.turbo/apps/backend/generated/
