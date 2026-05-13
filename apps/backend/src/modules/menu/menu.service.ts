@@ -187,7 +187,7 @@ export class MenuService {
             maxSelect: group.max_select,
             isActive: group.is_active,
             sortOrder: group.sort_order,
-            options: group.modifier_options.map((option) => ({
+            modifierOptions: group.modifier_options.map((option) => ({
               id: option.id,
               name: option.name,
               priceDelta: option.price_delta.toString(),

@@ -14,7 +14,7 @@ export class MenuItemModifierGroupResponseDto {
   maxSelect: number;
   isActive: boolean;
   sortOrder: number;
-  options: MenuItemModifierOptionResponseDto[];
+  modifierOptions: MenuItemModifierOptionResponseDto[];
 }
 
 export class MenuItemVariantResponseDto {
