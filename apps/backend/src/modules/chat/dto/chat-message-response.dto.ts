@@ -1,4 +1,6 @@
 export type ChatIntent =
+  | 'ADD_ITEM'
+  | 'REMOVE_ITEM'
   | 'MENU_CATEGORIES'
   | 'ORDER_SUMMARY'
   | 'CONFIRM_ORDER'

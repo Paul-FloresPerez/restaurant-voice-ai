@@ -23,6 +23,11 @@ const orderInclude = {
 } satisfies Prisma.ordersInclude;
 
 type OrderWithItems = Prisma.ordersGetPayload<{ include: typeof orderInclude }>;
+type MenuItemWithVariants = Prisma.menu_itemsGetPayload<{
+  include: {
+    menu_item_variants: true;
+  };
+}>;
 type TxClient = Prisma.TransactionClient;
 
 @Injectable()
@@ -46,10 +51,14 @@ export class ChatService {
         const intent = this.detectIntent(dto.message);
         let assistantMessage: string;
 
-        if (intent === 'MENU_CATEGORIES') {
-          assistantMessage = await this.buildMenuCategoriesMessage(tx);
-        } else if (intent === 'ORDER_SUMMARY') {
-          assistantMessage = this.buildOrderSummaryMessage(order);
+        if (intent === 'ADD_ITEM') {
+          const result = await this.addRequestedItem(tx, order, dto.message);
+          order = result.order;
+          assistantMessage = result.assistantMessage;
+        } else if (intent === 'REMOVE_ITEM') {
+          const result = await this.removeRequestedItem(tx, order, dto.message);
+          order = result.order;
+          assistantMessage = result.assistantMessage;
         } else if (intent === 'CONFIRM_ORDER') {
           if (order.order_items.length === 0) {
             assistantMessage =
@@ -58,6 +67,10 @@ export class ChatService {
             order = await this.confirmDraftOrder(tx, order.id);
             assistantMessage = this.buildConfirmedOrderMessage(order);
           }
+        } else if (intent === 'ORDER_SUMMARY') {
+          assistantMessage = this.buildOrderSummaryMessage(order);
+        } else if (intent === 'MENU_CATEGORIES') {
+          assistantMessage = await this.buildMenuCategoriesMessage(tx);
         } else {
           assistantMessage =
             'Estoy en modo prueba. Puedes pedirme el menu, el resumen de tu pedido o confirmar tu pedido.';
@@ -84,6 +97,25 @@ export class ChatService {
   private detectIntent(message: string): ChatIntent {
     const normalizedMessage = this.normalize(message);
 
+    if (this.containsAny(normalizedMessage, ['confirmar', 'confirmo'])) {
+      return 'CONFIRM_ORDER';
+    }
+
+    if (
+      this.containsAny(normalizedMessage, [
+        'repiteme mi pedido',
+        'repite mi pedido',
+        'resumen',
+        'que pedi',
+      ])
+    ) {
+      return 'ORDER_SUMMARY';
+    }
+
+    if (this.containsAny(normalizedMessage, ['quita', 'elimina'])) {
+      return 'REMOVE_ITEM';
+    }
+
     if (
       this.containsAny(normalizedMessage, [
         'menu',
@@ -95,14 +127,16 @@ export class ChatService {
       return 'MENU_CATEGORIES';
     }
 
-    if (this.containsAny(normalizedMessage, ['confirmar', 'confirmo'])) {
-      return 'CONFIRM_ORDER';
-    }
-
     if (
-      this.containsAny(normalizedMessage, ['pedido', 'resumen', 'que pedi'])
+      this.containsAny(normalizedMessage, [
+        'quiero',
+        'agrega',
+        'anade',
+        'ponme',
+        'dame',
+      ])
     ) {
-      return 'ORDER_SUMMARY';
+      return 'ADD_ITEM';
     }
 
     return 'UNKNOWN';
@@ -182,6 +216,162 @@ export class ChatService {
     });
 
     return this.findOrderOrThrow(tx, orderId);
+  }
+
+  private async addRequestedItem(
+    tx: TxClient,
+    order: OrderWithItems,
+    message: string,
+  ): Promise<{ order: OrderWithItems; assistantMessage: string }> {
+    const matches = await this.findMatchingMenuItems(tx, message);
+
+    if (matches.length === 0) {
+      return {
+        order,
+        assistantMessage:
+          'No encontre ese producto en el menu. Puedes decirlo de otra forma o pedirme los productos disponibles.',
+      };
+    }
+
+    if (matches.length > 1) {
+      return {
+        order,
+        assistantMessage: `Encontre varias opciones: ${matches
+          .map((item) => item.name)
+          .join(', ')}. Dime cual quieres agregar.`,
+      };
+    }
+
+    const item = matches[0];
+    const defaultVariant = item.menu_item_variants.find(
+      (variant) => variant.is_default && variant.is_available,
+    );
+
+    if (!defaultVariant) {
+      return {
+        order,
+        assistantMessage: `Encontre ${item.name}, pero no tiene una variante default disponible para agregar.`,
+      };
+    }
+
+    const createdItem = await tx.order_items.create({
+      data: {
+        order_id: order.id,
+        variant_id: defaultVariant.id,
+        menu_item_id: item.id,
+        item_name_snapshot: item.name,
+        variant_name_snapshot: defaultVariant.name,
+        unit_price_snapshot: defaultVariant.price,
+        quantity: 1,
+        line_total: defaultVariant.price,
+      },
+    });
+
+    await this.recalculateTotals(tx, order.id);
+    await this.createOrderEvent(tx, order.id, order_event_type.ADD_ITEM, {
+      itemId: createdItem.id,
+      variantId: defaultVariant.id,
+      quantity: 1,
+      source: 'CHAT_MESSAGE',
+    });
+
+    const updatedOrder = await this.findOrderOrThrow(tx, order.id);
+
+    return {
+      order: updatedOrder,
+      assistantMessage: `Agregue 1 ${item.name} a tu pedido. Total actual: ${this.formatMoney(
+        updatedOrder.total,
+      )}.`,
+    };
+  }
+
+  private async removeRequestedItem(
+    tx: TxClient,
+    order: OrderWithItems,
+    message: string,
+  ): Promise<{ order: OrderWithItems; assistantMessage: string }> {
+    if (order.order_items.length === 0) {
+      return {
+        order,
+        assistantMessage: 'Tu pedido esta vacio. No hay productos para quitar.',
+      };
+    }
+
+    const matches = this.findMatchingOrderItems(order, message);
+
+    if (matches.length === 0) {
+      return {
+        order,
+        assistantMessage:
+          'No encontre ese producto en tu pedido actual. Puedes pedirme el resumen para revisar lo que tienes.',
+      };
+    }
+
+    if (matches.length > 1) {
+      return {
+        order,
+        assistantMessage: `Encontre varias opciones en tu pedido: ${matches
+          .map((item) => item.item_name_snapshot)
+          .join(', ')}. Dime cual quieres quitar.`,
+      };
+    }
+
+    const [item] = matches;
+
+    await tx.order_items.delete({ where: { id: item.id } });
+    await this.recalculateTotals(tx, order.id);
+    await this.createOrderEvent(tx, order.id, order_event_type.REMOVE_ITEM, {
+      itemId: item.id,
+      source: 'CHAT_MESSAGE',
+    });
+
+    const updatedOrder = await this.findOrderOrThrow(tx, order.id);
+
+    return {
+      order: updatedOrder,
+      assistantMessage: `Quite ${item.item_name_snapshot} de tu pedido. Total actual: ${this.formatMoney(
+        updatedOrder.total,
+      )}.`,
+    };
+  }
+
+  private async findMatchingMenuItems(
+    tx: TxClient,
+    message: string,
+  ): Promise<MenuItemWithVariants[]> {
+    const items = await tx.menu_items.findMany({
+      where: {
+        is_active: true,
+        is_available: true,
+        categories: {
+          is_active: true,
+        },
+      },
+      include: {
+        menu_item_variants: {
+          where: { is_available: true },
+          orderBy: [
+            { is_default: 'desc' },
+            { sort_order: 'asc' },
+            { name: 'asc' },
+          ],
+        },
+      },
+      orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+    });
+
+    return items.filter((item) =>
+      this.itemMatchesMessage(message, [item.name, ...item.search_aliases]),
+    );
+  }
+
+  private findMatchingOrderItems(
+    order: OrderWithItems,
+    message: string,
+  ): OrderWithItems['order_items'] {
+    return order.order_items.filter((item) =>
+      this.itemMatchesMessage(message, [item.item_name_snapshot]),
+    );
   }
 
   private async buildMenuCategoriesMessage(tx: TxClient): Promise<string> {
@@ -308,6 +498,61 @@ export class ChatService {
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
       .toLowerCase();
+  }
+
+  private itemMatchesMessage(message: string, terms: string[]): boolean {
+    const normalizedMessage = this.normalize(message);
+    const messageTokens = this.toMeaningfulTokens(normalizedMessage);
+
+    return terms.some((term) => {
+      const normalizedTerm = this.normalize(term);
+
+      if (!normalizedTerm) {
+        return false;
+      }
+
+      if (normalizedMessage.includes(normalizedTerm)) {
+        return true;
+      }
+
+      const termTokens = this.toMeaningfulTokens(normalizedTerm);
+
+      return (
+        messageTokens.length > 0 &&
+        messageTokens.every((token) => termTokens.includes(token))
+      );
+    });
+  }
+
+  private toMeaningfulTokens(value: string): string[] {
+    const stopwords = new Set([
+      'agrega',
+      'al',
+      'anade',
+      'con',
+      'dame',
+      'del',
+      'el',
+      'elimina',
+      'favor',
+      'la',
+      'las',
+      'los',
+      'me',
+      'mi',
+      'para',
+      'pedido',
+      'ponme',
+      'por',
+      'quita',
+      'quiero',
+      'un',
+      'una',
+    ]);
+
+    return this.normalize(value)
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length > 1 && !stopwords.has(token));
   }
 
   private containsAny(value: string, patterns: string[]): boolean {
