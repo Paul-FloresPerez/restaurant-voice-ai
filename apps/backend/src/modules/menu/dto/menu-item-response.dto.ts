@@ -1,10 +1,31 @@
+export class MenuItemModifierOptionResponseDto {
+  id: string;
+  name: string;
+  priceDelta: string;
+  isAvailable: boolean;
+  sortOrder: number;
+}
+
+export class MenuItemModifierGroupResponseDto {
+  id: string;
+  name: string;
+  description: string | null;
+  minSelect: number;
+  maxSelect: number;
+  isActive: boolean;
+  sortOrder: number;
+  options: MenuItemModifierOptionResponseDto[];
+}
+
 export class MenuItemVariantResponseDto {
   id: string;
   name: string;
   sku: string | null;
   price: string;
   isDefault: boolean;
+  isAvailable?: boolean;
   sortOrder: number;
+  modifierGroups?: MenuItemModifierGroupResponseDto[];
 }
 
 export class MenuItemIngredientResponseDto {
