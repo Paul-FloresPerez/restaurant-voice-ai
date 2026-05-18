@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Session = {
   id: string;
@@ -36,7 +36,7 @@ type ChatResponse = {
 
 type ConversationEntry = {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   text: string;
 };
 
@@ -64,7 +64,110 @@ type Order = {
   items: OrderItem[];
 };
 
-const apiUrl = "/backend";
+type VoiceState =
+  | "start"
+  | "off"
+  | "activating"
+  | "listening"
+  | "processing"
+  | "speaking";
+
+type SpeechRecognitionAlternativeLike = {
+  transcript: string;
+};
+
+type SpeechRecognitionResultLike = {
+  0: SpeechRecognitionAlternativeLike;
+  isFinal: boolean;
+};
+
+type SpeechRecognitionEventLike = Event & {
+  resultIndex: number;
+  results: {
+    length: number;
+    [index: number]: SpeechRecognitionResultLike;
+  };
+};
+
+type SpeechRecognitionErrorEventLike = Event & {
+  error: string;
+};
+
+type SpeechRecognitionLike = EventTarget & {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives: number;
+  onend: (() => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  }
+}
+
+const apiUrl = (
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001"
+).replace(/\/$/, "");
+
+const leoIntro =
+  "Bienvenido al Restaurante Real. Soy Leo, tu mesero virtual. Te ayudare a consultar la carta y realizar tu pedido. Toca el centro de la pantalla para hablar. Puedes decir: leer carta, bebidas, comida, postres, repetir mi pedido o confirmar pedido.";
+
+const micActivatedMessage = "Microfono activado. Te escucho.";
+const micOffMessage = "Microfono apagado. Toca para hablar nuevamente.";
+const noVoiceMessage =
+  "No detecte tu voz. Toca nuevamente el centro de la pantalla para intentarlo.";
+const noPermissionMessage =
+  "No tengo permiso para usar el microfono. Activa el permiso del navegador o usa el modo prueba.";
+const notUnderstoodMessage =
+  "No pude entenderte. Puedes decir: leer carta, bebidas, comida o repetir mi pedido.";
+const unsupportedRecognitionMessage =
+  "Este navegador no permite reconocimiento de voz aqui. Usa Chrome o Edge, activa permisos, o usa el modo prueba.";
+
+const quickActions = [
+  { label: "Leer carta", message: "leer carta" },
+  { label: "Bebidas", message: "que bebidas hay" },
+  { label: "Comida", message: "que comida hay" },
+  { label: "Postres", message: "que postres hay" },
+  { label: "Repetir pedido", message: "repiteme mi pedido" },
+  { label: "Confirmar pedido", message: "confirmo mi pedido" },
+];
+
+const voiceStatus: Record<VoiceState, { title: string; helper: string }> = {
+  start: {
+    title: "Toca para hablar",
+    helper: "Leo iniciara la sesion y te guiara paso a paso.",
+  },
+  off: {
+    title: "Microfono apagado",
+    helper: "Toca el centro de la pantalla para hablar con Leo.",
+  },
+  activating: {
+    title: "Microfono activado",
+    helper: "Leo esta preparando la escucha.",
+  },
+  listening: {
+    title: "Escuchando...",
+    helper: "Habla ahora. Puedes decir: leer carta, bebidas o repetir mi pedido.",
+  },
+  processing: {
+    title: "Procesando solicitud...",
+    helper: "Leo esta enviando tu mensaje al sistema del restaurante.",
+  },
+  speaking: {
+    title: "Leo esta respondiendo",
+    helper: "Escucha la respuesta. Luego toca otra vez para hablar.",
+  },
+};
 
 async function apiRequest<T>(
   path: string,
@@ -114,8 +217,91 @@ function formatMoney(value: string): string {
   return `S/ ${numberValue.toFixed(2)}`;
 }
 
-function getDefaultVariant(item: MenuItem): MenuVariant | undefined {
-  return item.variants.find((variant) => variant.isDefault) ?? item.variants[0];
+function newEntry(role: ConversationEntry["role"], text: string) {
+  return {
+    id: crypto.randomUUID(),
+    role,
+    text,
+  };
+}
+
+function getRecognitionConstructor() {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+
+  return window.SpeechRecognition ?? window.webkitSpeechRecognition;
+}
+
+function getRecognitionLang() {
+  if (typeof navigator === "undefined") {
+    return "es-PE";
+  }
+
+  const languages = [navigator.language, ...(navigator.languages ?? [])];
+  const supportedPreference = ["es-PE", "es-MX", "es-ES"];
+
+  return (
+    supportedPreference.find((lang) =>
+      languages.some(
+        (browserLang) => browserLang.toLowerCase() === lang.toLowerCase(),
+      ),
+    ) ?? "es-PE"
+  );
+}
+
+function pickSpanishVoice(voices: SpeechSynthesisVoice[]) {
+  const spanishVoices = voices.filter((voice) => {
+    const haystack = `${voice.lang} ${voice.name}`.toLowerCase();
+    return (
+      haystack.includes("es") ||
+      haystack.includes("spanish") ||
+      haystack.includes("espanol") ||
+      haystack.includes("español")
+    );
+  });
+
+  const preferredTerms = [
+    "es-pe",
+    "es-mx",
+    "es-es",
+    "pablo",
+    "jorge",
+    "diego",
+    "carlos",
+    "raul",
+    "raúl",
+    "male",
+    "spanish",
+    "espanol",
+    "español",
+  ];
+
+  return (
+    preferredTerms
+      .map((term) =>
+        spanishVoices.find((voice) =>
+          `${voice.lang} ${voice.name}`.toLowerCase().includes(term),
+        ),
+      )
+      .find(Boolean) ??
+    spanishVoices[0] ??
+    voices[0]
+  );
+}
+
+function buildCategoryMessage(items: MenuItem[]) {
+  const categories = Array.from(
+    new Set(items.map((item) => item.categoryName).filter(Boolean)),
+  );
+
+  if (categories.length === 0) {
+    return "Aun no tengo categorias disponibles. Puedes decir: leer carta, bebidas, comida o postres.";
+  }
+
+  return `Tambien puedo leer opciones de la carta. Categorias disponibles: ${categories.join(
+    ", ",
+  )}. Puedes decir: leer carta, bebidas, comida, postres, repetir mi pedido o confirmar pedido.`;
 }
 
 export default function Home() {
@@ -124,11 +310,22 @@ export default function Home() {
   const [conversation, setConversation] = useState<ConversationEntry[]>([]);
   const [message, setMessage] = useState("");
   const [order, setOrder] = useState<Order | null>(null);
-  const [orderStatus, setOrderStatus] = useState("Sin pedido consultado.");
+  const [orderStatus, setOrderStatus] = useState("Sin pedido activo.");
+  const [voiceState, setVoiceState] = useState<VoiceState>("start");
+  const [heardText, setHeardText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [isLoadingMenu, setIsLoadingMenu] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [isTestModeOpen, setIsTestModeOpen] = useState(false);
+  const [clientReady, setClientReady] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
+  const [selectedVoice, setSelectedVoice] =
+    useState<SpeechSynthesisVoice | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const finalTranscriptRef = useRef("");
+  const ignoreNextEndRef = useRef(false);
+  const lastMicErrorRef = useRef<string | null>(null);
 
   const groupedMenu = useMemo(() => {
     return menuItems.reduce<Record<string, MenuItem[]>>((groups, item) => {
@@ -138,59 +335,144 @@ export default function Home() {
     }, {});
   }, [menuItems]);
 
+  const sessionLabel = session ? "Activa" : "No iniciada";
+  const isMicDisabled =
+    !clientReady ||
+    isCreatingSession ||
+    isSendingMessage ||
+    voiceState === "listening" ||
+    voiceState === "processing" ||
+    voiceState === "speaking";
+  const isChatDisabled = !session || isSendingMessage;
+
   useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      setClientReady(true);
+      setSpeechSupported(Boolean(getRecognitionConstructor()));
+      loadVoices();
+    });
+
     void loadMenu();
+
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.onvoiceschanged = loadVoices;
+    }
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      recognitionRef.current?.abort();
+      window.speechSynthesis?.cancel();
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.onvoiceschanged = null;
+      }
+    };
   }, []);
 
-  async function loadMenu() {
+  function loadVoices() {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return;
+    }
+
+    const voices = window.speechSynthesis.getVoices();
+
+    if (voices.length > 0) {
+      setSelectedVoice(pickSpanishVoice(voices) ?? null);
+    }
+  }
+
+  function speakAsLeo(text: string, onEnd?: () => void) {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      onEnd?.();
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = selectedVoice?.lang ?? "es-PE";
+    utterance.rate = 0.95;
+    utterance.pitch = 0.95;
+    utterance.volume = 1;
+
+    if (selectedVoice) {
+      utterance.voice = selectedVoice;
+    }
+
+    utterance.onend = () => onEnd?.();
+    utterance.onerror = () => onEnd?.();
+    window.speechSynthesis.speak(utterance);
+  }
+
+  async function loadMenu(): Promise<MenuItem[]> {
     setIsLoadingMenu(true);
     setError(null);
 
     try {
       const items = await apiRequest<MenuItem[]>("/menu/items");
       setMenuItems(items);
+      return items;
     } catch (requestError) {
       setError(
         requestError instanceof Error
           ? requestError.message
           : "No se pudo cargar el menu.",
       );
+      return [];
     } finally {
       setIsLoadingMenu(false);
     }
   }
 
   async function createSession() {
+    if (isCreatingSession) {
+      return null;
+    }
+
     setIsCreatingSession(true);
+    setVoiceState("processing");
     setError(null);
 
     try {
-      const createdSession = await apiRequest<Session>("/sessions", {
-        method: "POST",
-        body: JSON.stringify({ channel: "frontend-test" }),
-      });
+      const [createdSession, loadedItems] = await Promise.all([
+        apiRequest<Session>("/sessions", {
+          method: "POST",
+          body: JSON.stringify({ channel: "frontend-leo-accessible-voice" }),
+        }),
+        loadMenu(),
+      ]);
+      const categoryMessage = buildCategoryMessage(loadedItems);
+
       setSession(createdSession);
-      setConversation([]);
       setOrder(null);
       setOrderStatus("Sesion creada. Aun no hay pedido activo.");
+      setConversation([
+        newEntry("assistant", leoIntro),
+        newEntry("assistant", categoryMessage),
+      ]);
+      setVoiceState("speaking");
+      speakAsLeo(`${leoIntro} ${categoryMessage}`, () => setVoiceState("off"));
+
+      return createdSession;
     } catch (requestError) {
+      setVoiceState("start");
       setError(
         requestError instanceof Error
           ? requestError.message
           : "No se pudo crear la sesion.",
       );
+      return null;
     } finally {
       setIsCreatingSession(false);
     }
   }
 
-  async function loadCurrentOrder(sessionId: string) {
+  async function loadCurrentOrder(sessionId: string): Promise<Order | null> {
     try {
       const currentOrder = await apiRequest<Order>(
         `/orders/current/${sessionId}`,
       );
       setOrder(currentOrder);
       setOrderStatus("");
+      return currentOrder;
     } catch (requestError) {
       setOrder(null);
       setOrderStatus(
@@ -198,322 +480,576 @@ export default function Home() {
           ? requestError.message
           : "No se pudo consultar el pedido actual.",
       );
+      return null;
     }
   }
 
-  async function sendMessage(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function sendChatMessage(text: string, targetSession = session) {
+    const cleanMessage = text.trim();
 
-    const cleanMessage = message.trim();
-
-    if (!session || !cleanMessage) {
+    if (!targetSession || !cleanMessage) {
       return;
     }
 
     setIsSendingMessage(true);
+    setVoiceState("processing");
     setError(null);
-    setMessage("");
-
-    const userEntry: ConversationEntry = {
-      id: crypto.randomUUID(),
-      role: "user",
-      text: cleanMessage,
-    };
-
-    setConversation((entries) => [...entries, userEntry]);
+    setConversation((entries) => [...entries, newEntry("user", cleanMessage)]);
 
     try {
       const response = await apiRequest<ChatResponse>("/chat/message", {
         method: "POST",
         body: JSON.stringify({
-          sessionId: session.id,
+          sessionId: targetSession.id,
           message: cleanMessage,
         }),
       });
+      await loadCurrentOrder(targetSession.id);
 
       setConversation((entries) => [
         ...entries,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          text: response.assistantMessage,
-        },
+        newEntry("assistant", response.assistantMessage),
       ]);
+      setVoiceState("speaking");
+      speakAsLeo(response.assistantMessage, () => {
+        setVoiceState("off");
+      });
     } catch (requestError) {
       const errorMessage =
         requestError instanceof Error
           ? requestError.message
           : "No se pudo enviar el mensaje.";
       setError(errorMessage);
+      setVoiceState("off");
       setConversation((entries) => [
         ...entries,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          text: `Error: ${errorMessage}`,
-        },
+        newEntry("assistant", `Leo: ${errorMessage}`),
       ]);
+      await loadCurrentOrder(targetSession.id);
     } finally {
-      await loadCurrentOrder(session.id);
       setIsSendingMessage(false);
     }
   }
 
+  async function submitMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const cleanMessage = message.trim();
+
+    if (!cleanMessage) {
+      return;
+    }
+
+    setMessage("");
+    await sendChatMessage(cleanMessage);
+  }
+
+  async function runQuickAction(text: string) {
+    let activeSession = session;
+
+    if (!activeSession) {
+      activeSession = await createSession();
+    }
+
+    if (activeSession) {
+      await sendChatMessage(text, activeSession);
+    }
+  }
+
+  function handleMicError(errorCode: string) {
+    lastMicErrorRef.current = errorCode;
+    setVoiceState("off");
+
+    const message =
+      errorCode === "not-allowed" || errorCode === "service-not-allowed"
+        ? noPermissionMessage
+        : errorCode === "no-speech"
+          ? noVoiceMessage
+        : notUnderstoodMessage;
+
+    setConversation((entries) => [...entries, newEntry("assistant", message)]);
+    speakAsLeo(message);
+  }
+
+  function startRecognition(activeSession: Session) {
+    const Recognition = getRecognitionConstructor();
+
+    window.speechSynthesis?.cancel();
+
+    if (!Recognition) {
+      setVoiceState("off");
+      setConversation((entries) => [
+        ...entries,
+        newEntry("assistant", unsupportedRecognitionMessage),
+      ]);
+      speakAsLeo(unsupportedRecognitionMessage);
+      return;
+    }
+
+    recognitionRef.current?.abort();
+    finalTranscriptRef.current = "";
+    lastMicErrorRef.current = null;
+    ignoreNextEndRef.current = false;
+    setHeardText("");
+    setVoiceState("activating");
+
+    const recognition = new Recognition();
+    recognition.lang = getRecognitionLang();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (event) => {
+      let interimText = "";
+      let finalText = "";
+
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const transcript = result[0]?.transcript ?? "";
+
+        if (result.isFinal) {
+          finalText += transcript;
+        } else {
+          interimText += transcript;
+        }
+      }
+
+      const visibleText = `${finalText} ${interimText}`.trim();
+
+      if (visibleText) {
+        setHeardText(visibleText);
+      }
+
+      if (finalText.trim()) {
+        finalTranscriptRef.current = finalText.trim();
+        ignoreNextEndRef.current = true;
+        recognition.stop();
+        void sendChatMessage(finalText.trim(), activeSession);
+      }
+    };
+
+    recognition.onerror = (event) => {
+      ignoreNextEndRef.current = true;
+      handleMicError(event.error);
+    };
+
+    recognition.onend = () => {
+      recognitionRef.current = null;
+
+      if (ignoreNextEndRef.current || lastMicErrorRef.current) {
+        ignoreNextEndRef.current = false;
+        return;
+      }
+
+      if (!finalTranscriptRef.current.trim()) {
+        setVoiceState("off");
+        setConversation((entries) => [
+          ...entries,
+          newEntry("assistant", noVoiceMessage),
+        ]);
+        speakAsLeo(`${noVoiceMessage} ${micOffMessage}`);
+        return;
+      }
+
+      setVoiceState("off");
+      speakAsLeo(micOffMessage);
+    };
+
+    recognitionRef.current = recognition;
+
+    speakAsLeo(micActivatedMessage, () => {
+      try {
+        setVoiceState("listening");
+        recognition.start();
+      } catch {
+        handleMicError("start-failed");
+      }
+    });
+  }
+
+  async function handleMainTouch() {
+    if (isMicDisabled) {
+      return;
+    }
+
+    let activeSession = session;
+
+    if (!activeSession) {
+      activeSession = await createSession();
+      if (!activeSession) {
+        return;
+      }
+    }
+
+    startRecognition(activeSession);
+  }
+
   return (
-    <main className="min-h-screen bg-stone-50 text-stone-950">
-      <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 py-6 sm:px-6 lg:px-8">
-        <header className="flex flex-col gap-4 border-b border-stone-200 pb-6 md:flex-row md:items-end md:justify-between">
+    <main className="min-h-screen bg-neutral-950 text-white">
+      <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-4 px-4 py-4 sm:px-6">
+        <header className="flex flex-col gap-3 rounded-md border border-white/15 bg-neutral-900 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p className="text-sm font-medium text-emerald-700">
-              Prueba local
-            </p>
-            <h1 className="mt-1 text-3xl font-semibold">
-              Menu por voz del restaurante
+            <h1 className="text-3xl font-semibold tracking-normal">
+              Menu por Voz
             </h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-stone-600">
-              Pantalla minima para crear una sesion, hablar con el asistente y
-              revisar el pedido actual sin usar curl.
+            <p className="mt-1 text-xl text-neutral-200">
+              Leo, tu mesero virtual
+            </p>
+            <p className="mt-1 text-base text-neutral-400">
+              Restaurante Real
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={createSession}
-            disabled={isCreatingSession}
-            className="inline-flex h-11 items-center justify-center rounded-md bg-emerald-700 px-4 text-sm font-semibold text-white transition hover:bg-emerald-800 disabled:cursor-not-allowed disabled:bg-stone-400"
-          >
-            {isCreatingSession ? "Creando..." : "Crear sesion"}
-          </button>
+          <div className="flex items-center gap-3">
+            <div className="rounded-md border border-white/15 bg-black px-4 py-2">
+              <p className="text-xs uppercase text-neutral-400">
+                Estado de sesion
+              </p>
+              <p className="text-xl font-semibold">{sessionLabel}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void createSession()}
+              disabled={isCreatingSession}
+              className="min-h-12 rounded-md bg-emerald-300 px-4 text-lg font-semibold text-neutral-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-300"
+            >
+              {session ? "Nueva sesion" : "Iniciar"}
+            </button>
+          </div>
         </header>
 
         {error ? (
           <div
             role="alert"
-            className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
+            className="rounded-md border border-red-300 bg-red-950 px-5 py-4 text-xl text-red-100"
           >
             {error}
           </div>
         ) : null}
 
-        <section className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
-          <div className="flex flex-col gap-6">
-            <section className="rounded-md border border-stone-200 bg-white p-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <h2 className="text-lg font-semibold">Sesion activa</h2>
-                  <p className="mt-1 break-all text-sm text-stone-600">
-                    {session ? session.id : "No hay sesion creada."}
-                  </p>
-                </div>
-                <span className="w-fit rounded-md bg-stone-100 px-3 py-1 text-xs font-medium text-stone-700">
-                  {session ? session.status : "Sin sesion"}
-                </span>
-              </div>
-            </section>
+        <section className="grid flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
+          <section className="flex min-h-[42rem] flex-col rounded-md border border-white/15 bg-neutral-900 p-4">
+            <button
+              type="button"
+              onClick={() => void handleMainTouch()}
+              disabled={isMicDisabled}
+              aria-label="Toca para hablar con Leo"
+              className="relative flex flex-1 flex-col items-center justify-center overflow-hidden rounded-md border border-emerald-300/40 bg-black px-5 py-8 text-center outline-none transition hover:border-emerald-200 focus-visible:ring-4 focus-visible:ring-emerald-300 disabled:cursor-wait disabled:border-white/15"
+            >
+              {voiceState === "listening" ? (
+                <>
+                  <span className="absolute h-[20rem] w-[20rem] rounded-full border border-emerald-300/50 animate-ping" />
+                  <span className="absolute h-[34rem] w-[34rem] rounded-full border border-emerald-300/20 animate-pulse" />
+                </>
+              ) : null}
 
-            <section className="rounded-md border border-stone-200 bg-white p-4">
-              <div className="mb-4 flex items-center justify-between gap-3">
-                <h2 className="text-lg font-semibold">Menu</h2>
-                <button
-                  type="button"
-                  onClick={loadMenu}
-                  disabled={isLoadingMenu}
-                  className="rounded-md border border-stone-300 px-3 py-2 text-sm font-medium text-stone-800 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:text-stone-400"
+              {voiceState === "processing" ? (
+                <span className="absolute h-[28rem] w-[28rem] rounded-full border border-sky-300/30 animate-pulse" />
+              ) : null}
+
+              <span
+                className={`relative flex h-64 w-64 items-center justify-center rounded-full border text-white shadow-2xl sm:h-80 sm:w-80 ${
+                  voiceState === "listening"
+                    ? "border-emerald-200 bg-emerald-400/25 shadow-emerald-400/30"
+                    : voiceState === "processing"
+                      ? "border-sky-200 bg-sky-400/20 shadow-sky-400/20"
+                      : "border-white/25 bg-neutral-900"
+                }`}
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  className="h-32 w-32 sm:h-40 sm:w-40"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="1.7"
                 >
-                  {isLoadingMenu ? "Cargando..." : "Recargar"}
-                </button>
-              </div>
+                  <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" />
+                  <path d="M5 11a7 7 0 0 0 14 0" />
+                  <path d="M12 18v3" />
+                  <path d="M8 21h8" />
+                </svg>
+              </span>
 
-              {menuItems.length === 0 ? (
-                <p className="text-sm text-stone-600">
-                  No hay productos cargados.
+              <p className="relative mt-8 text-4xl font-semibold sm:text-6xl">
+                {voiceStatus[voiceState].title}
+              </p>
+              <p className="relative mt-5 max-w-3xl text-2xl leading-10 text-neutral-200">
+                {voiceStatus[voiceState].helper}
+              </p>
+
+              {heardText ? (
+                <p className="relative mt-6 max-w-3xl rounded-md border border-emerald-300/40 bg-neutral-950/90 px-5 py-4 text-2xl text-emerald-100">
+                  Escuche: {heardText}
                 </p>
-              ) : (
-                <div className="grid gap-5 md:grid-cols-2">
-                  {Object.entries(groupedMenu).map(([category, items]) => (
-                    <div key={category}>
-                      <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-stone-500">
-                        {category}
-                      </h3>
-                      <ul className="space-y-3">
-                        {items.map((item) => {
-                          const variant = getDefaultVariant(item);
+              ) : null}
 
-                          return (
-                            <li
-                              key={item.id}
-                              className="rounded-md border border-stone-200 p-3"
-                            >
-                              <div className="flex items-start justify-between gap-3">
-                                <div>
-                                  <p className="font-medium">{item.name}</p>
-                                  {item.description ? (
-                                    <p className="mt-1 text-sm leading-5 text-stone-600">
-                                      {item.description}
-                                    </p>
-                                  ) : null}
-                                </div>
-                                <p className="shrink-0 text-sm font-semibold text-emerald-700">
-                                  {variant ? formatMoney(variant.price) : "--"}
-                                </p>
-                              </div>
-                              <div className="mt-2 flex flex-wrap gap-2 text-xs text-stone-600">
-                                {item.isVegetarian ? (
-                                  <span className="rounded-md bg-emerald-50 px-2 py-1 text-emerald-800">
-                                    Vegetariano
-                                  </span>
-                                ) : null}
-                                {item.isVegan ? (
-                                  <span className="rounded-md bg-lime-50 px-2 py-1 text-lime-800">
-                                    Vegano
-                                  </span>
-                                ) : null}
-                                {item.isSpicy ? (
-                                  <span className="rounded-md bg-red-50 px-2 py-1 text-red-800">
-                                    Picante
-                                  </span>
-                                ) : null}
-                              </div>
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
+              <div className="relative mt-8 grid gap-3 text-left text-xl text-neutral-300 sm:grid-cols-2">
+                {quickActions.slice(0, 4).map((action) => (
+                  <p
+                    key={action.message}
+                    className="rounded-md border border-white/10 bg-neutral-950/80 px-4 py-3"
+                  >
+                    Puedes decir: {action.message}.
+                  </p>
+                ))}
+              </div>
+            </button>
+          </section>
+
+          <aside className="grid gap-4">
+            <SecondaryActions
+              disabled={isCreatingSession || isSendingMessage}
+              onAction={(text) => void runQuickAction(text)}
+            />
+            <OrderPanel order={order} orderStatus={orderStatus} />
+            <MenuSummary groupedMenu={groupedMenu} isLoadingMenu={isLoadingMenu} />
+          </aside>
+        </section>
+
+        <section className="rounded-md border border-white/15 bg-neutral-900 p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-xl font-semibold">Historial y modo prueba</h2>
+              <p className="mt-1 text-base text-neutral-400">
+                El texto queda oculto para usuarios; se usa solo para pruebas.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsTestModeOpen((isOpen) => !isOpen)}
+              className="min-h-11 rounded-md border border-white/20 px-4 text-base font-semibold transition hover:bg-white hover:text-neutral-950"
+            >
+              {isTestModeOpen ? "Ocultar modo prueba" : "Modo prueba"}
+            </button>
           </div>
 
-          <aside className="flex flex-col gap-6">
-            <section className="rounded-md border border-stone-200 bg-white p-4">
-              <h2 className="text-lg font-semibold">Asistente</h2>
-              <form onSubmit={sendMessage} className="mt-4 flex flex-col gap-3">
-                <label
-                  htmlFor="message"
-                  className="text-sm font-medium text-stone-700"
-                >
-                  Mensaje
-                </label>
-                <textarea
-                  id="message"
-                  value={message}
-                  onChange={(event) => setMessage(event.target.value)}
-                  disabled={!session || isSendingMessage}
-                  rows={4}
-                  maxLength={1000}
-                  placeholder={
-                    session
-                      ? "Ejemplo: quiero una hamburguesa"
-                      : "Primero crea una sesion"
-                  }
-                  className="min-h-28 resize-y rounded-md border border-stone-300 px-3 py-2 text-sm outline-none transition focus:border-emerald-700 focus:ring-2 focus:ring-emerald-100 disabled:bg-stone-100"
-                />
-                <button
-                  type="submit"
-                  disabled={!session || !message.trim() || isSendingMessage}
-                  className="h-11 rounded-md bg-stone-950 px-4 text-sm font-semibold text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-400"
-                >
-                  {isSendingMessage ? "Enviando..." : "Enviar"}
-                </button>
-              </form>
-            </section>
+          <ConversationPreview conversation={conversation} />
 
-            <section className="rounded-md border border-stone-200 bg-white p-4">
-              <h2 className="text-lg font-semibold">Conversacion</h2>
-              <div className="mt-4 max-h-80 space-y-3 overflow-y-auto pr-1">
-                {conversation.length === 0 ? (
-                  <p className="text-sm text-stone-600">
-                    No hay mensajes todavia.
-                  </p>
-                ) : (
-                  conversation.map((entry) => (
-                    <div
-                      key={entry.id}
-                      className={
-                        entry.role === "user"
-                          ? "ml-6 rounded-md bg-emerald-700 px-3 py-2 text-sm text-white"
-                          : "mr-6 rounded-md bg-stone-100 px-3 py-2 text-sm text-stone-800"
-                      }
-                    >
-                      <p className="mb-1 text-xs font-semibold uppercase opacity-80">
-                        {entry.role === "user" ? "Usuario" : "Asistente"}
-                      </p>
-                      <p className="leading-5">{entry.text}</p>
-                    </div>
-                  ))
-                )}
-              </div>
-            </section>
+          {isTestModeOpen ? (
+            <form
+              onSubmit={submitMessage}
+              className="mt-4 grid gap-3 border-t border-white/10 pt-4 lg:grid-cols-[minmax(0,1fr)_180px]"
+            >
+              <label htmlFor="message" className="sr-only">
+                Mensaje de prueba
+              </label>
+              <textarea
+                id="message"
+                value={message}
+                onChange={(event) => setMessage(event.target.value)}
+                disabled={isChatDisabled}
+                rows={3}
+                maxLength={1000}
+                placeholder="Modo prueba: escribe una frase para POST /chat/message"
+                className="min-h-24 resize-y rounded-md border border-white/20 bg-black px-4 py-3 text-lg text-white outline-none placeholder:text-neutral-500 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-300/25 disabled:cursor-not-allowed disabled:bg-neutral-800"
+              />
+              <button
+                type="submit"
+                disabled={isChatDisabled || !message.trim()}
+                className="min-h-14 rounded-md bg-emerald-300 px-5 text-xl font-semibold text-neutral-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-300"
+              >
+                {isSendingMessage ? "Enviando..." : "Enviar"}
+              </button>
+            </form>
+          ) : null}
 
-            <section className="rounded-md border border-stone-200 bg-white p-4">
-              <h2 className="text-lg font-semibold">Pedido actual</h2>
-              <div className="mt-4">
-                {order ? (
-                  <div>
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-sm text-stone-600">
-                        Estado:{" "}
-                        <span className="font-medium text-stone-950">
-                          {order.status}
-                        </span>
-                      </p>
-                      <p className="text-base font-semibold text-emerald-700">
-                        {formatMoney(order.total)}
-                      </p>
-                    </div>
-                    {order.items.length === 0 ? (
-                      <p className="mt-3 text-sm text-stone-600">
-                        El pedido esta vacio.
-                      </p>
-                    ) : (
-                      <ul className="mt-3 space-y-3">
-                        {order.items.map((item) => (
-                          <li
-                            key={item.id}
-                            className="border-t border-stone-200 pt-3 text-sm"
-                          >
-                            <div className="flex justify-between gap-3">
-                              <p className="font-medium">
-                                {item.quantity} x {item.itemName}
-                                {item.variantName &&
-                                item.variantName !== "Default"
-                                  ? ` (${item.variantName})`
-                                  : ""}
-                              </p>
-                              <p className="font-semibold">
-                                {formatMoney(item.lineTotal)}
-                              </p>
-                            </div>
-                            {item.specialInstructions ? (
-                              <p className="mt-1 text-stone-600">
-                                Nota: {item.specialInstructions}
-                              </p>
-                            ) : null}
-                            {item.modifiers.length > 0 ? (
-                              <p className="mt-1 text-stone-600">
-                                Extras:{" "}
-                                {item.modifiers
-                                  .map(
-                                    (modifier) =>
-                                      `${modifier.quantity} x ${modifier.optionName}`,
-                                  )
-                                  .join(", ")}
-                              </p>
-                            ) : null}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                ) : (
-                  <p className="text-sm text-stone-600">{orderStatus}</p>
-                )}
-              </div>
-            </section>
-          </aside>
+          {clientReady && !speechSupported ? (
+            <p className="mt-4 rounded-md border border-yellow-300/50 bg-yellow-950 px-4 py-3 text-lg text-yellow-100">
+              SpeechRecognition no esta disponible en este navegador. Usa
+              Chrome o Edge, o abre Modo prueba.
+            </p>
+          ) : null}
         </section>
       </div>
     </main>
+  );
+}
+
+function SecondaryActions({
+  disabled,
+  onAction,
+}: {
+  disabled: boolean;
+  onAction: (message: string) => void;
+}) {
+  return (
+    <section className="rounded-md border border-white/15 bg-neutral-900 p-4">
+      <h2 className="text-2xl font-semibold">Guia rapida</h2>
+      <p className="mt-1 text-base text-neutral-400">
+        Botones grandes que envian frases como si fueran dichas por voz.
+      </p>
+      <div className="mt-4 grid gap-3">
+        {quickActions.map((action) => (
+          <button
+            key={action.message}
+            type="button"
+            onClick={() => onAction(action.message)}
+            disabled={disabled}
+            className="min-h-14 rounded-md border border-white/20 px-4 text-xl font-semibold transition hover:bg-white hover:text-neutral-950 disabled:cursor-not-allowed disabled:text-neutral-500"
+          >
+            {action.label}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ConversationPreview({
+  conversation,
+}: {
+  conversation: ConversationEntry[];
+}) {
+  const visibleEntries = conversation.slice(-4);
+
+  return (
+    <div className="mt-4 grid gap-3 md:grid-cols-2">
+      {visibleEntries.length === 0 ? (
+        <p className="rounded-md border border-white/10 bg-black p-4 text-lg text-neutral-300">
+          Al iniciar la sesion, Leo dara la bienvenida por voz.
+        </p>
+      ) : (
+        visibleEntries.map((entry) => (
+          <div
+            key={entry.id}
+            className={
+              entry.role === "user"
+                ? "rounded-md bg-emerald-300 p-4 text-neutral-950"
+                : "rounded-md border border-white/10 bg-black p-4 text-white"
+            }
+          >
+            <p className="text-sm font-semibold uppercase tracking-wide opacity-75">
+              {entry.role === "user" ? "Cliente" : "Leo"}
+            </p>
+            <p className="mt-2 text-lg leading-7">{entry.text}</p>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function OrderPanel({
+  order,
+  orderStatus,
+}: {
+  order: Order | null;
+  orderStatus: string;
+}) {
+  return (
+    <section className="rounded-md border border-white/15 bg-neutral-900 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-semibold">Pedido actual</h2>
+          <p className="mt-1 text-base text-neutral-400">
+            Visible, pero secundario a la voz.
+          </p>
+        </div>
+        <span className="rounded-md bg-black px-3 py-2 text-sm text-neutral-300">
+          {order?.status ?? "Sin pedido"}
+        </span>
+      </div>
+
+      <div className="mt-4 rounded-md bg-black p-4">
+        <p className="text-base text-neutral-400">Total</p>
+        <p className="mt-1 text-4xl font-semibold text-emerald-300">
+          {order ? formatMoney(order.total) : "S/ 0.00"}
+        </p>
+      </div>
+
+      <div className="mt-4 max-h-64 overflow-y-auto">
+        {order ? (
+          order.items.length === 0 ? (
+            <p className="text-lg leading-8 text-neutral-300">
+              El pedido esta vacio.
+            </p>
+          ) : (
+            <ul className="space-y-3">
+              {order.items.map((item) => (
+                <li
+                  key={item.id}
+                  className="rounded-md border border-white/10 bg-black p-3"
+                >
+                  <div className="flex justify-between gap-3">
+                    <p className="text-lg font-semibold">
+                      {item.quantity} x {item.itemName}
+                    </p>
+                    <p className="text-lg font-semibold text-emerald-300">
+                      {formatMoney(item.lineTotal)}
+                    </p>
+                  </div>
+                  {item.variantName && item.variantName !== "Default" ? (
+                    <p className="mt-1 text-base text-neutral-400">
+                      {item.variantName}
+                    </p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )
+        ) : (
+          <p className="text-lg leading-8 text-neutral-300">{orderStatus}</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function MenuSummary({
+  groupedMenu,
+  isLoadingMenu,
+}: {
+  groupedMenu: Record<string, MenuItem[]>;
+  isLoadingMenu: boolean;
+}) {
+  const entries = Object.entries(groupedMenu);
+
+  return (
+    <section className="rounded-md border border-white/15 bg-neutral-900 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-2xl font-semibold">Carta</h2>
+        <span className="text-sm text-neutral-400">
+          {isLoadingMenu ? "Cargando..." : `${entries.length} categorias`}
+        </span>
+      </div>
+      <div className="mt-4 max-h-80 overflow-y-auto pr-1">
+        {entries.length === 0 ? (
+          <p className="text-lg text-neutral-300">No hay productos cargados.</p>
+        ) : (
+          <div className="space-y-4">
+            {entries.map(([category, items]) => (
+              <div key={category}>
+                <h3 className="text-base font-semibold uppercase tracking-wide text-emerald-300">
+                  {category}
+                </h3>
+                <ul className="mt-2 space-y-2">
+                  {items.slice(0, 3).map((item) => (
+                    <li
+                      key={item.id}
+                      className="rounded-md border border-white/10 bg-black p-3"
+                    >
+                      <p className="text-lg font-semibold">{item.name}</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {item.variants.slice(0, 2).map((variant) => (
+                          <span
+                            key={variant.id}
+                            className="rounded-md bg-neutral-800 px-2 py-1 text-sm text-neutral-200"
+                          >
+                            {variant.name}: {formatMoney(variant.price)}
+                          </span>
+                        ))}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
