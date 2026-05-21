@@ -98,6 +98,7 @@ type SpeechRecognitionLike = EventTarget & {
   interimResults: boolean;
   lang: string;
   maxAlternatives: number;
+  onstart: (() => void) | null;
   onend: (() => void) | null;
   onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
   onresult: ((event: SpeechRecognitionEventLike) => void) | null;
@@ -128,6 +129,8 @@ const noVoiceMessage =
   "No detecte tu voz. Toca nuevamente el centro de la pantalla para intentarlo.";
 const noPermissionMessage =
   "No tengo permiso para usar el microfono. Activa el permiso del navegador o usa el modo prueba.";
+const noAudioCaptureMessage =
+  "No encuentro un microfono disponible. Revisa el dispositivo de audio o usa el modo prueba.";
 const notUnderstoodMessage =
   "No pude entenderte. Puedes decir: leer carta, bebidas, comida o repetir mi pedido.";
 const unsupportedRecognitionMessage =
@@ -234,20 +237,7 @@ function getRecognitionConstructor() {
 }
 
 function getRecognitionLang() {
-  if (typeof navigator === "undefined") {
-    return "es-PE";
-  }
-
-  const languages = [navigator.language, ...(navigator.languages ?? [])];
-  const supportedPreference = ["es-PE", "es-MX", "es-ES"];
-
-  return (
-    supportedPreference.find((lang) =>
-      languages.some(
-        (browserLang) => browserLang.toLowerCase() === lang.toLowerCase(),
-      ),
-    ) ?? "es-PE"
-  );
+  return "es-PE";
 }
 
 function pickSpanishVoice(voices: SpeechSynthesisVoice[]) {
@@ -320,12 +310,16 @@ export default function Home() {
   const [isTestModeOpen, setIsTestModeOpen] = useState(false);
   const [clientReady, setClientReady] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
-  const [selectedVoice, setSelectedVoice] =
-    useState<SpeechSynthesisVoice | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const finalTranscriptRef = useRef("");
   const ignoreNextEndRef = useRef(false);
   const lastMicErrorRef = useRef<string | null>(null);
+  const hasPlayedInitialMenuRef = useRef(false);
+  const isCreatingSessionRef = useRef(false);
+  const isListeningRef = useRef(false);
+  const isSpeakingRef = useRef(false);
+  const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const speechRunIdRef = useRef(0);
 
   const groupedMenu = useMemo(() => {
     return menuItems.reduce<Record<string, MenuItem[]>>((groups, item) => {
@@ -345,61 +339,110 @@ export default function Home() {
     voiceState === "speaking";
   const isChatDisabled = !session || isSendingMessage;
 
-  useEffect(() => {
-    const frameId = window.requestAnimationFrame(() => {
-      setClientReady(true);
-      setSpeechSupported(Boolean(getRecognitionConstructor()));
-      loadVoices();
-    });
-
-    void loadMenu();
-
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.onvoiceschanged = loadVoices;
-    }
-
-    return () => {
-      window.cancelAnimationFrame(frameId);
-      recognitionRef.current?.abort();
-      window.speechSynthesis?.cancel();
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.onvoiceschanged = null;
-      }
-    };
-  }, []);
-
-  function loadVoices() {
+  async function loadVoices() {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
-      return;
+      return null;
     }
 
-    const voices = window.speechSynthesis.getVoices();
+    const voices = await getAvailableVoices();
 
-    if (voices.length > 0) {
-      setSelectedVoice(pickSpanishVoice(voices) ?? null);
+    if (voices.length > 0 && !selectedVoiceRef.current) {
+      const voice = pickSpanishVoice(voices) ?? null;
+      selectedVoiceRef.current = voice;
+      console.log("Voz de Leo seleccionada:", voice?.name, voice?.lang);
     }
+
+    return selectedVoiceRef.current;
   }
 
-  function speakAsLeo(text: string, onEnd?: () => void) {
+  function getAvailableVoices(): Promise<SpeechSynthesisVoice[]> {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return Promise.resolve([]);
+    }
+
+    const loadedVoices = window.speechSynthesis.getVoices();
+
+    if (loadedVoices.length > 0) {
+      return Promise.resolve(loadedVoices);
+    }
+
+    return new Promise((resolve) => {
+      const previousHandler = window.speechSynthesis.onvoiceschanged;
+      const fallbackTimer = window.setTimeout(() => {
+        window.speechSynthesis.onvoiceschanged = previousHandler;
+        resolve(window.speechSynthesis.getVoices());
+      }, 800);
+
+      window.speechSynthesis.onvoiceschanged = (event) => {
+        window.clearTimeout(fallbackTimer);
+        window.speechSynthesis.onvoiceschanged = previousHandler;
+        previousHandler?.call(window.speechSynthesis, event);
+        resolve(window.speechSynthesis.getVoices());
+      };
+    });
+  }
+
+  async function speakAsLeo(
+    text: string,
+    onEnd?: () => void,
+    options: { markAsSpeaking?: boolean } = {},
+  ) {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
       onEnd?.();
       return;
     }
 
+    stopRecognition("Leo is about to speak");
     window.speechSynthesis.cancel();
+
+    if (isSpeakingRef.current) {
+      console.log("Voz de Leo: se cancelo una locucion previa para evitar duplicados.");
+    }
+
+    const runId = speechRunIdRef.current + 1;
+    const shouldMarkAsSpeaking = options.markAsSpeaking ?? true;
+    speechRunIdRef.current = runId;
+    isSpeakingRef.current = true;
+
+    if (shouldMarkAsSpeaking) {
+      setVoiceState("speaking");
+    }
+
+    const stableVoice = selectedVoiceRef.current ?? (await loadVoices());
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = selectedVoice?.lang ?? "es-PE";
+    utterance.lang = "es-PE";
     utterance.rate = 0.95;
     utterance.pitch = 0.95;
     utterance.volume = 1;
 
-    if (selectedVoice) {
-      utterance.voice = selectedVoice;
+    if (stableVoice) {
+      utterance.voice = stableVoice;
     }
 
-    utterance.onend = () => onEnd?.();
-    utterance.onerror = () => onEnd?.();
+    const finish = () => {
+      if (speechRunIdRef.current !== runId) {
+        return;
+      }
+
+      isSpeakingRef.current = false;
+      onEnd?.();
+    };
+
+    utterance.onend = finish;
+    utterance.onerror = finish;
     window.speechSynthesis.speak(utterance);
+  }
+
+  function stopRecognition(reason: string) {
+    if (!recognitionRef.current) {
+      return;
+    }
+
+    console.log("SpeechRecognition detenido:", reason);
+    ignoreNextEndRef.current = true;
+    isListeningRef.current = false;
+    recognitionRef.current.abort();
+    recognitionRef.current = null;
   }
 
   async function loadMenu(): Promise<MenuItem[]> {
@@ -422,11 +465,39 @@ export default function Home() {
     }
   }
 
+  useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      setClientReady(true);
+      setSpeechSupported(Boolean(getRecognitionConstructor()));
+      void loadVoices();
+      void loadMenu();
+    });
+
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.onvoiceschanged = () => {
+        void loadVoices();
+      };
+    }
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      stopRecognition("component cleanup");
+      window.speechSynthesis?.cancel();
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.onvoiceschanged = null;
+      }
+    };
+    // Mount-only browser initialization. The called functions are event-style
+    // helpers and should not retrigger this setup on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function createSession() {
-    if (isCreatingSession) {
+    if (isCreatingSessionRef.current) {
       return null;
     }
 
+    isCreatingSessionRef.current = true;
     setIsCreatingSession(true);
     setVoiceState("processing");
     setError(null);
@@ -444,12 +515,17 @@ export default function Home() {
       setSession(createdSession);
       setOrder(null);
       setOrderStatus("Sesion creada. Aun no hay pedido activo.");
-      setConversation([
-        newEntry("assistant", leoIntro),
-        newEntry("assistant", categoryMessage),
-      ]);
-      setVoiceState("speaking");
-      speakAsLeo(`${leoIntro} ${categoryMessage}`, () => setVoiceState("off"));
+
+      if (!hasPlayedInitialMenuRef.current) {
+        hasPlayedInitialMenuRef.current = true;
+        setConversation([
+          newEntry("assistant", leoIntro),
+          newEntry("assistant", categoryMessage),
+        ]);
+        void speakAsLeo(`${leoIntro} ${categoryMessage}`, () =>
+          setVoiceState("off"),
+        );
+      }
 
       return createdSession;
     } catch (requestError) {
@@ -461,6 +537,7 @@ export default function Home() {
       );
       return null;
     } finally {
+      isCreatingSessionRef.current = false;
       setIsCreatingSession(false);
     }
   }
@@ -510,8 +587,7 @@ export default function Home() {
         ...entries,
         newEntry("assistant", response.assistantMessage),
       ]);
-      setVoiceState("speaking");
-      speakAsLeo(response.assistantMessage, () => {
+      void speakAsLeo(response.assistantMessage, () => {
         setVoiceState("off");
       });
     } catch (requestError) {
@@ -545,30 +621,34 @@ export default function Home() {
   }
 
   async function runQuickAction(text: string) {
-    let activeSession = session;
-
-    if (!activeSession) {
-      activeSession = await createSession();
+    if (!session) {
+      console.log("Accion rapida ignorada: no hay sesion activa.");
+      return;
     }
 
-    if (activeSession) {
-      await sendChatMessage(text, activeSession);
-    }
+    await sendChatMessage(text, session);
   }
 
   function handleMicError(errorCode: string) {
     lastMicErrorRef.current = errorCode;
     setVoiceState("off");
 
+    if (errorCode === "aborted") {
+      console.log("SpeechRecognition abortado.");
+      return;
+    }
+
     const message =
       errorCode === "not-allowed" || errorCode === "service-not-allowed"
         ? noPermissionMessage
+        : errorCode === "audio-capture"
+          ? noAudioCaptureMessage
         : errorCode === "no-speech"
           ? noVoiceMessage
         : notUnderstoodMessage;
 
     setConversation((entries) => [...entries, newEntry("assistant", message)]);
-    speakAsLeo(message);
+    void speakAsLeo(message);
   }
 
   function startRecognition(activeSession: Session) {
@@ -582,7 +662,7 @@ export default function Home() {
         ...entries,
         newEntry("assistant", unsupportedRecognitionMessage),
       ]);
-      speakAsLeo(unsupportedRecognitionMessage);
+      void speakAsLeo(unsupportedRecognitionMessage);
       return;
     }
 
@@ -596,8 +676,14 @@ export default function Home() {
     const recognition = new Recognition();
     recognition.lang = getRecognitionLang();
     recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 3;
+
+    recognition.onstart = () => {
+      isListeningRef.current = true;
+      setVoiceState("listening");
+      console.log("SpeechRecognition iniciado. lang:", recognition.lang);
+    };
 
     recognition.onresult = (event) => {
       let interimText = "";
@@ -621,20 +707,27 @@ export default function Home() {
       }
 
       if (finalText.trim()) {
-        finalTranscriptRef.current = finalText.trim();
+        const normalizedTranscript = finalText.toLowerCase().trim();
+        console.log("Texto reconocido:", normalizedTranscript);
+        finalTranscriptRef.current = normalizedTranscript;
         ignoreNextEndRef.current = true;
+        isListeningRef.current = false;
         recognition.stop();
-        void sendChatMessage(finalText.trim(), activeSession);
+        void sendChatMessage(normalizedTranscript, activeSession);
       }
     };
 
     recognition.onerror = (event) => {
+      console.log("SpeechRecognition error:", event.error);
       ignoreNextEndRef.current = true;
+      isListeningRef.current = false;
       handleMicError(event.error);
     };
 
     recognition.onend = () => {
+      console.log("SpeechRecognition finalizado.");
       recognitionRef.current = null;
+      isListeningRef.current = false;
 
       if (ignoreNextEndRef.current || lastMicErrorRef.current) {
         ignoreNextEndRef.current = false;
@@ -647,28 +740,37 @@ export default function Home() {
           ...entries,
           newEntry("assistant", noVoiceMessage),
         ]);
-        speakAsLeo(`${noVoiceMessage} ${micOffMessage}`);
+        void speakAsLeo(`${noVoiceMessage} ${micOffMessage}`);
         return;
       }
 
       setVoiceState("off");
-      speakAsLeo(micOffMessage);
+      void speakAsLeo(micOffMessage);
     };
 
     recognitionRef.current = recognition;
 
-    speakAsLeo(micActivatedMessage, () => {
+    void speakAsLeo(
+      micActivatedMessage,
+      () => {
       try {
-        setVoiceState("listening");
+        if (isListeningRef.current || isSpeakingRef.current) {
+          console.log("No se inicia SpeechRecognition: Leo sigue hablando o ya escucha.");
+          return;
+        }
+
         recognition.start();
       } catch {
         handleMicError("start-failed");
       }
-    });
+      },
+      { markAsSpeaking: false },
+    );
   }
 
   async function handleMainTouch() {
-    if (isMicDisabled) {
+    if (isMicDisabled || isListeningRef.current || isSpeakingRef.current) {
+      console.log("Microfono bloqueado: Leo esta hablando, escuchando o procesando.");
       return;
     }
 
@@ -801,7 +903,7 @@ export default function Home() {
 
           <aside className="grid gap-4">
             <SecondaryActions
-              disabled={isCreatingSession || isSendingMessage}
+              disabled={!session || isCreatingSession || isSendingMessage}
               onAction={(text) => void runQuickAction(text)}
             />
             <OrderPanel order={order} orderStatus={orderStatus} />
