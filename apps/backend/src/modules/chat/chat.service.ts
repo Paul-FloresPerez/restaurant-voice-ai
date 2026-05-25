@@ -28,6 +28,10 @@ type MenuItemWithVariants = Prisma.menu_itemsGetPayload<{
     menu_item_variants: true;
   };
 }>;
+type ScoredMenuItemMatch = {
+  item: MenuItemWithVariants;
+  score: number;
+};
 type TxClient = Prisma.TransactionClient;
 
 @Injectable()
@@ -360,9 +364,29 @@ export class ChatService {
       orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
     });
 
-    return items.filter((item) =>
-      this.itemMatchesMessage(message, [item.name, ...item.search_aliases]),
-    );
+    const normalizedMessage = this.normalize(message);
+    const messageTokens = this.toMeaningfulTokens(normalizedMessage);
+    const matches: ScoredMenuItemMatch[] = items
+      .map((item) => ({
+        item,
+        score: this.scoreMenuItemMatch(
+          item,
+          normalizedMessage,
+          messageTokens,
+          items,
+        ),
+      }))
+      .filter((match) => match.score > 0);
+
+    if (matches.length === 0) {
+      return [];
+    }
+
+    const bestScore = Math.max(...matches.map((match) => match.score));
+
+    return matches
+      .filter((match) => match.score === bestScore)
+      .map((match) => match.item);
   }
 
   private findMatchingOrderItems(
@@ -497,7 +521,120 @@ export class ChatService {
     return value
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
-      .toLowerCase();
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .replace(/\s+/g, ' ');
+  }
+
+  private scoreMenuItemMatch(
+    item: MenuItemWithVariants,
+    normalizedMessage: string,
+    messageTokens: string[],
+    allItems: MenuItemWithVariants[],
+  ): number {
+    const nameScore = this.scoreContainedTerm(
+      normalizedMessage,
+      item.name,
+      300,
+    );
+
+    if (nameScore > 0) {
+      return nameScore;
+    }
+
+    const aliasScore = this.bestAliasScore(
+      item,
+      normalizedMessage,
+      allItems,
+    );
+    const broadScore = this.matchesByUserTokens(messageTokens, [
+      item.name,
+      ...item.search_aliases,
+    ])
+      ? 100
+      : 0;
+
+    return Math.max(aliasScore, broadScore);
+  }
+
+  private bestAliasScore(
+    item: MenuItemWithVariants,
+    normalizedMessage: string,
+    allItems: MenuItemWithVariants[],
+  ): number {
+    return item.search_aliases.reduce((bestScore, alias) => {
+      const normalizedAlias = this.normalize(alias);
+
+      if (!normalizedAlias || !normalizedMessage.includes(normalizedAlias)) {
+        return bestScore;
+      }
+
+      const aliasTokens = this.toMeaningfulTokens(normalizedAlias);
+
+      if (aliasTokens.length === 0) {
+        return bestScore;
+      }
+
+      if (
+        aliasTokens.length === 1 &&
+        !this.isSpecificSingleTokenAlias(aliasTokens[0], allItems)
+      ) {
+        return Math.max(bestScore, 100);
+      }
+
+      return Math.max(bestScore, 250 + aliasTokens.length);
+    }, 0);
+  }
+
+  private scoreContainedTerm(
+    normalizedMessage: string,
+    term: string,
+    baseScore: number,
+  ): number {
+    const normalizedTerm = this.normalize(term);
+
+    if (!normalizedTerm || !normalizedMessage.includes(normalizedTerm)) {
+      return 0;
+    }
+
+    const termTokens = this.toMeaningfulTokens(normalizedTerm);
+
+    if (termTokens.length === 0) {
+      return 0;
+    }
+
+    return baseScore + termTokens.length;
+  }
+
+  private matchesByUserTokens(
+    messageTokens: string[],
+    terms: string[],
+  ): boolean {
+    if (messageTokens.length === 0) {
+      return false;
+    }
+
+    return terms.some((term) => {
+      const termTokens = this.toMeaningfulTokens(term);
+
+      return messageTokens.every((token) => termTokens.includes(token));
+    });
+  }
+
+  private isSpecificSingleTokenAlias(
+    aliasToken: string,
+    allItems: MenuItemWithVariants[],
+  ): boolean {
+    const matchingItems = allItems.filter((item) => {
+      const terms = [item.name, ...item.search_aliases];
+
+      return terms.some((term) =>
+        this.toMeaningfulTokens(term).includes(aliasToken),
+      );
+    });
+
+    return matchingItems.length === 1;
   }
 
   private itemMatchesMessage(message: string, terms: string[]): boolean {
@@ -515,12 +652,7 @@ export class ChatService {
         return true;
       }
 
-      const termTokens = this.toMeaningfulTokens(normalizedTerm);
-
-      return (
-        messageTokens.length > 0 &&
-        messageTokens.every((token) => termTokens.includes(token))
-      );
+      return this.matchesByUserTokens(messageTokens, [normalizedTerm]);
     });
   }
 
@@ -551,7 +683,7 @@ export class ChatService {
     ]);
 
     return this.normalize(value)
-      .split(/[^a-z0-9]+/)
+      .split(/\s+/)
       .filter((token) => token.length > 1 && !stopwords.has(token));
   }
 
