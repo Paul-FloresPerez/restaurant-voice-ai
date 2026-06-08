@@ -70,6 +70,7 @@ type VoiceState =
   | "processing"
   | "speaking"
   | "error";
+type RecognitionLanguage = "es-ES" | "es-MX" | "es-PE";
 
 type SpeechRecognitionAlternativeLike = {
   transcript: string;
@@ -107,6 +108,10 @@ type SpeechRecognitionLike = EventTarget & {
 };
 
 type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+type SpeakOptions = {
+  markAsSpeaking?: boolean;
+  onEnd?: () => void;
+};
 
 declare global {
   interface Window {
@@ -119,10 +124,9 @@ const apiUrl = (
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001"
 ).replace(/\/$/, "");
 
-const leoIntro =
-  "Bienvenido al Restaurante Real. Soy Leo, tu mesero virtual. Te ayudare a consultar la carta y realizar tu pedido. Toca el centro de la pantalla para hablar. Puedes decir: leer carta, bebidas, comida, postres, repetir mi pedido o confirmar pedido.";
+const luffyIntro =
+  "Bienvenido al Restaurante Real. Soy Luffy, tu mesero virtual. Puedo leerte la carta, ayudarte a elegir productos y registrar tu pedido. Puedes decir: leer carta, hamburguesas, bebidas, postres, repetir pedido o confirmar pedido.";
 
-const micActivatedMessage = "Microfono activado. Te escucho.";
 const micOffMessage = "Microfono apagado. Toca para hablar nuevamente.";
 const noVoiceMessage =
   "No detecte tu voz. Toca nuevamente el centro de la pantalla para intentarlo.";
@@ -131,7 +135,9 @@ const noPermissionMessage =
 const noAudioCaptureMessage =
   "No encuentro un microfono disponible. Revisa el dispositivo de audio o usa el modo prueba.";
 const recognitionNetworkMessage =
-  "Hubo un problema con el reconocimiento de voz. Toca nuevamente para intentarlo.";
+  "El reconocimiento de voz se interrumpio. Puedes usar los botones rapidos o intentar el microfono nuevamente en unos segundos.";
+const temporaryVoiceUnavailableMessage =
+  "Reconocimiento de voz no disponible temporalmente";
 const notUnderstoodMessage =
   "No pude entenderte. Puedes decir: leer carta, bebidas, comida o repetir mi pedido.";
 const unsupportedRecognitionMessage =
@@ -139,28 +145,34 @@ const unsupportedRecognitionMessage =
 
 const quickActions = [
   { label: "Leer carta", message: "leer carta" },
+  { label: "Hamburguesas", message: "que hamburguesas hay" },
   { label: "Bebidas", message: "que bebidas hay" },
-  { label: "Comida", message: "que comida hay" },
   { label: "Postres", message: "que postres hay" },
   { label: "Repetir pedido", message: "repiteme mi pedido" },
   { label: "Confirmar pedido", message: "confirmo mi pedido" },
+];
+const recognitionLanguageOptions: RecognitionLanguage[] = [
+  "es-ES",
+  "es-MX",
+  "es-PE",
 ];
 
 const voiceStatus: Record<VoiceState, { title: string; helper: string }> = {
   idle: {
     title: "Toca para hablar",
-    helper: "Leo iniciara la sesion y te guiara paso a paso.",
+    helper: "Luffy iniciara la sesion y te guiara paso a paso.",
   },
   listening: {
-    title: "Escuchando...",
-    helper: "Habla ahora. Puedes decir: leer carta, bebidas o repetir mi pedido.",
+    title: "Escuchando",
+    helper:
+      "Habla ahora. Puedes decir: leer carta, hamburguesas, bebidas o repetir pedido.",
   },
   processing: {
-    title: "Procesando solicitud...",
-    helper: "Leo esta preparando o enviando tu solicitud.",
+    title: "Procesando",
+    helper: "Luffy esta preparando o enviando tu solicitud.",
   },
   speaking: {
-    title: "Leo esta respondiendo",
+    title: "Luffy esta hablando",
     helper: "Escucha la respuesta. Luego toca otra vez para hablar.",
   },
   error: {
@@ -233,43 +245,56 @@ function getRecognitionConstructor() {
   return window.SpeechRecognition ?? window.webkitSpeechRecognition;
 }
 
-function getRecognitionLang() {
-  return "es-PE";
-}
-
 function pickSpanishVoice(voices: SpeechSynthesisVoice[]) {
   const spanishVoices = voices.filter((voice) => {
     const haystack = `${voice.lang} ${voice.name}`.toLowerCase();
     return (
-      haystack.includes("es") ||
+      voice.lang.toLowerCase().startsWith("es") ||
       haystack.includes("spanish") ||
-      haystack.includes("espanol") ||
-      haystack.includes("español")
+      haystack.includes("espanol")
     );
   });
 
-  const preferredTerms = [
-    "es-pe",
-    "es-mx",
-    "es-es",
+  const masculineTerms = [
     "pablo",
     "jorge",
     "diego",
     "carlos",
     "raul",
-    "raúl",
+    "alvaro",
     "male",
-    "spanish",
-    "espanol",
-    "español",
+    "hombre",
   ];
+  const languageTerms = ["es-pe", "es-es", "es-mx"];
+  const normalizedVoice = (voice: SpeechSynthesisVoice) =>
+    `${voice.lang} ${voice.name}`.toLowerCase();
+
+  for (const language of languageTerms) {
+    const voice = spanishVoices.find((candidate) => {
+      const haystack = normalizedVoice(candidate);
+      return (
+        haystack.includes(language) &&
+        masculineTerms.some((term) => haystack.includes(term))
+      );
+    });
+
+    if (voice) {
+      return voice;
+    }
+  }
+
+  const masculineVoice = spanishVoices.find((voice) =>
+    masculineTerms.some((term) => normalizedVoice(voice).includes(term)),
+  );
+
+  if (masculineVoice) {
+    return masculineVoice;
+  }
 
   return (
-    preferredTerms
+    languageTerms
       .map((term) =>
-        spanishVoices.find((voice) =>
-          `${voice.lang} ${voice.name}`.toLowerCase().includes(term),
-        ),
+        spanishVoices.find((voice) => normalizedVoice(voice).includes(term)),
       )
       .find(Boolean) ??
     spanishVoices[0] ??
@@ -283,12 +308,12 @@ function buildCategoryMessage(items: MenuItem[]) {
   );
 
   if (categories.length === 0) {
-    return "Aun no tengo categorias disponibles. Puedes decir: leer carta, bebidas, comida o postres.";
+    return "Aun no tengo categorias disponibles. Puedes decir: leer carta, hamburguesas, bebidas o postres.";
   }
 
   return `Tambien puedo leer opciones de la carta. Categorias disponibles: ${categories.join(
     ", ",
-  )}. Puedes decir: leer carta, bebidas, comida, postres, repetir mi pedido o confirmar pedido.`;
+  )}. Puedes decir: leer carta, hamburguesas, bebidas, postres, repetir pedido o confirmar pedido.`;
 }
 
 export default function Home() {
@@ -307,17 +332,34 @@ export default function Home() {
   const [isTestModeOpen, setIsTestModeOpen] = useState(false);
   const [clientReady, setClientReady] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
+  const [selectedVoiceLabel, setSelectedVoiceLabel] =
+    useState("Voz no seleccionada");
+  const [recognitionLang, setRecognitionLang] =
+    useState<RecognitionLanguage>("es-ES");
+  const [lastRecognitionError, setLastRecognitionError] =
+    useState("Sin errores");
+  const [isMicTemporarilyUnavailable, setIsMicTemporarilyUnavailable] =
+    useState(false);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const finalTranscriptRef = useRef("");
   const ignoreNextEndRef = useRef(false);
   const lastMicErrorRef = useRef<string | null>(null);
   const hasPlayedInitialMenuRef = useRef(false);
   const isCreatingSessionRef = useRef(false);
+  const isSendingMessageRef = useRef(false);
   const isListeningRef = useRef(false);
   const isSpeakingRef = useRef(false);
+  const speechOutputUnlockedRef = useRef(false);
   const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const activeSpeechTextRef = useRef<string | null>(null);
+  const pendingSpeechRef = useRef<{
+    text: string;
+    options: SpeakOptions;
+  } | null>(null);
   const speechRunIdRef = useRef(0);
   const speechTimeoutRef = useRef<number | null>(null);
+  const networkErrorCountRef = useRef(0);
+  const micReenableTimeoutRef = useRef<number | null>(null);
 
   const groupedMenu = useMemo(() => {
     return menuItems.reduce<Record<string, MenuItem[]>>((groups, item) => {
@@ -332,10 +374,17 @@ export default function Home() {
     !clientReady ||
     isCreatingSession ||
     isSendingMessage ||
+    isMicTemporarilyUnavailable ||
     voiceState === "listening" ||
     voiceState === "processing" ||
     voiceState === "speaking";
-  const isChatDisabled = !session || isSendingMessage;
+  const isChatDisabled = isCreatingSession || isSendingMessage;
+  const currentVoiceStatus = isMicTemporarilyUnavailable
+    ? {
+        title: temporaryVoiceUnavailableMessage,
+        helper: "Usa los botones rapidos o el modo prueba. Se reactivara en unos segundos.",
+      }
+    : voiceStatus[voiceState];
 
   async function loadVoices() {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
@@ -347,10 +396,26 @@ export default function Home() {
     if (voices.length > 0 && !selectedVoiceRef.current) {
       const voice = pickSpanishVoice(voices) ?? null;
       selectedVoiceRef.current = voice;
-      console.log("Voz de Leo seleccionada:", voice?.name, voice?.lang);
+      setSelectedVoiceLabel(
+        voice ? `${voice.name} (${voice.lang})` : "Voz no disponible",
+      );
+      console.log("Voz de Luffy seleccionada:", voice?.name, voice?.lang);
     }
 
     return selectedVoiceRef.current;
+  }
+
+  function unlockSpeechOutput() {
+    if (
+      speechOutputUnlockedRef.current ||
+      typeof window === "undefined" ||
+      !("speechSynthesis" in window)
+    ) {
+      return;
+    }
+
+    window.speechSynthesis.resume();
+    speechOutputUnlockedRef.current = true;
   }
 
   function getAvailableVoices(): Promise<SpeechSynthesisVoice[]> {
@@ -380,21 +445,37 @@ export default function Home() {
     });
   }
 
-  async function speakAsLeo(
-    text: string,
-    onEnd?: () => void,
-    options: { markAsSpeaking?: boolean } = {},
-  ) {
+  async function speak(text: string, options: SpeakOptions = {}) {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
-      onEnd?.();
+      options.onEnd?.();
       return;
     }
 
-    stopRecognition("Leo is about to speak");
-    window.speechSynthesis.cancel();
+    if (isListeningRef.current) {
+      console.log("Voz de Luffy bloqueada: el microfono esta escuchando.");
+      options.onEnd?.();
+      return;
+    }
 
-    if (isSpeakingRef.current) {
-      console.log("Voz de Leo: se cancelo una locucion previa para evitar duplicados.");
+    if (recognitionRef.current) {
+      stopRecognition("Luffy is about to speak");
+    }
+
+    unlockSpeechOutput();
+
+    if (isSpeakingRef.current && activeSpeechTextRef.current === text) {
+      console.log("Voz de Luffy: locucion duplicada ignorada.");
+      return;
+    }
+
+    if (
+      isSpeakingRef.current ||
+      window.speechSynthesis.speaking ||
+      window.speechSynthesis.pending
+    ) {
+      console.log("Voz de Luffy: locucion en cola hasta terminar la actual.");
+      pendingSpeechRef.current = { text, options };
+      return;
     }
 
     if (speechTimeoutRef.current !== null) {
@@ -406,6 +487,7 @@ export default function Home() {
     const shouldMarkAsSpeaking = options.markAsSpeaking ?? true;
     speechRunIdRef.current = runId;
     isSpeakingRef.current = true;
+    activeSpeechTextRef.current = text;
 
     if (shouldMarkAsSpeaking) {
       setVoiceState("speaking");
@@ -415,7 +497,7 @@ export default function Home() {
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "es-PE";
     utterance.rate = 0.95;
-    utterance.pitch = 0.95;
+    utterance.pitch = 0.85;
     utterance.volume = 1;
 
     if (stableVoice) {
@@ -440,9 +522,28 @@ export default function Home() {
       }
 
       isSpeakingRef.current = false;
-      onEnd?.();
+      activeSpeechTextRef.current = null;
+      options.onEnd?.();
+
+      const pendingSpeech = pendingSpeechRef.current;
+      pendingSpeechRef.current = null;
+
+      if (pendingSpeech) {
+        void speak(pendingSpeech.text, pendingSpeech.options);
+      }
     };
 
+    utterance.onstart = () => {
+      if (speechRunIdRef.current !== runId) {
+        return;
+      }
+
+      isSpeakingRef.current = true;
+
+      if (shouldMarkAsSpeaking) {
+        setVoiceState("speaking");
+      }
+    };
     utterance.onend = finish;
     utterance.onerror = (event) => {
       console.log("speechSynthesis error:", event.error);
@@ -450,11 +551,14 @@ export default function Home() {
     };
     speechTimeoutRef.current = window.setTimeout(
       () => {
+        if (speechRunIdRef.current !== runId) {
+          return;
+        }
+
         console.log("speechSynthesis timeout de seguridad.");
-        window.speechSynthesis.cancel();
         finish();
       },
-      Math.min(25000, Math.max(5000, text.length * 85)),
+      Math.min(30000, Math.max(7000, text.length * 95)),
     );
     window.speechSynthesis.speak(utterance);
   }
@@ -467,7 +571,11 @@ export default function Home() {
     console.log("SpeechRecognition detenido:", reason);
     ignoreNextEndRef.current = true;
     isListeningRef.current = false;
-    recognitionRef.current.abort();
+    try {
+      recognitionRef.current.abort();
+    } catch {
+      console.log("SpeechRecognition abort no disponible.");
+    }
     recognitionRef.current = null;
   }
 
@@ -491,6 +599,32 @@ export default function Home() {
     }
   }
 
+  async function ensureMenuLoaded(): Promise<MenuItem[]> {
+    if (menuItems.length > 0) {
+      return menuItems;
+    }
+
+    return loadMenu();
+  }
+
+  async function playWelcome(items: MenuItem[]) {
+    if (hasPlayedInitialMenuRef.current) {
+      return;
+    }
+
+    hasPlayedInitialMenuRef.current = true;
+    const categoryMessage = buildCategoryMessage(items);
+
+    setConversation((entries) => [
+      ...entries,
+      newEntry("assistant", luffyIntro),
+      newEntry("assistant", categoryMessage),
+    ]);
+    await speak(`${luffyIntro} ${categoryMessage}`, {
+      onEnd: () => setVoiceState("idle"),
+    });
+  }
+
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
       setClientReady(true);
@@ -512,7 +646,13 @@ export default function Home() {
         window.clearTimeout(speechTimeoutRef.current);
         speechTimeoutRef.current = null;
       }
+      if (micReenableTimeoutRef.current !== null) {
+        window.clearTimeout(micReenableTimeoutRef.current);
+        micReenableTimeoutRef.current = null;
+      }
       isSpeakingRef.current = false;
+      activeSpeechTextRef.current = null;
+      pendingSpeechRef.current = null;
       window.speechSynthesis?.cancel();
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.onvoiceschanged = null;
@@ -523,7 +663,9 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function createSession() {
+  async function createSession({
+    shouldPlayWelcome = true,
+  }: { shouldPlayWelcome?: boolean } = {}) {
     if (isCreatingSessionRef.current) {
       return null;
     }
@@ -537,25 +679,20 @@ export default function Home() {
       const [createdSession, loadedItems] = await Promise.all([
         apiRequest<Session>("/sessions", {
           method: "POST",
-          body: JSON.stringify({ channel: "frontend-leo-accessible-voice" }),
+          body: JSON.stringify({ channel: "frontend-luffy-accessible-voice" }),
         }),
-        loadMenu(),
+        ensureMenuLoaded(),
       ]);
-      const categoryMessage = buildCategoryMessage(loadedItems);
 
       setSession(createdSession);
       setOrder(null);
       setOrderStatus("Sesion creada. Aun no hay pedido activo.");
 
-      if (!hasPlayedInitialMenuRef.current) {
-        hasPlayedInitialMenuRef.current = true;
-        setConversation([
-          newEntry("assistant", leoIntro),
-          newEntry("assistant", categoryMessage),
-        ]);
-        void speakAsLeo(`${leoIntro} ${categoryMessage}`, () =>
-          setVoiceState("idle"),
-        );
+      if (shouldPlayWelcome) {
+        hasPlayedInitialMenuRef.current = false;
+        await playWelcome(loadedItems);
+      } else {
+        setVoiceState("idle");
       }
 
       return createdSession;
@@ -595,10 +732,21 @@ export default function Home() {
   async function sendChatMessage(text: string, targetSession = session) {
     const cleanMessage = text.trim();
 
-    if (!targetSession || !cleanMessage) {
+    if (!cleanMessage) {
       return;
     }
 
+    let activeSession = targetSession;
+
+    if (!activeSession) {
+      activeSession = await createSession({ shouldPlayWelcome: false });
+    }
+
+    if (!activeSession) {
+      return;
+    }
+
+    isSendingMessageRef.current = true;
     setIsSendingMessage(true);
     setVoiceState("processing");
     setError(null);
@@ -608,34 +756,36 @@ export default function Home() {
       const response = await apiRequest<ChatResponse>("/chat/message", {
         method: "POST",
         body: JSON.stringify({
-          sessionId: targetSession.id,
+          sessionId: activeSession.id,
           message: cleanMessage,
         }),
       });
-      await loadCurrentOrder(targetSession.id);
+      await loadCurrentOrder(activeSession.id);
 
       setConversation((entries) => [
         ...entries,
         newEntry("assistant", response.assistantMessage),
       ]);
-      void speakAsLeo(response.assistantMessage, () => {
-        setVoiceState("idle");
+      networkErrorCountRef.current = 0;
+      void speak(response.assistantMessage, {
+        onEnd: () => setVoiceState("idle"),
       });
     } catch (requestError) {
       const errorMessage =
         requestError instanceof Error
           ? requestError.message
           : "No se pudo enviar el mensaje.";
-      const spokenError = `Leo tuvo un problema enviando tu mensaje. ${errorMessage}. Toca nuevamente para intentarlo.`;
+      const spokenError = `Luffy tuvo un problema enviando tu mensaje. ${errorMessage}. Toca nuevamente para intentarlo.`;
       setError(errorMessage);
       setVoiceState("error");
       setConversation((entries) => [
         ...entries,
         newEntry("assistant", spokenError),
       ]);
-      await loadCurrentOrder(targetSession.id);
-      void speakAsLeo(spokenError, () => setVoiceState("idle"));
+      await loadCurrentOrder(activeSession.id);
+      void speak(spokenError, { onEnd: () => setVoiceState("idle") });
     } finally {
+      isSendingMessageRef.current = false;
       setIsSendingMessage(false);
     }
   }
@@ -650,26 +800,42 @@ export default function Home() {
     }
 
     setMessage("");
+    unlockSpeechOutput();
+    stopRecognition("developer text mode");
     await sendChatMessage(cleanMessage);
   }
 
   async function runQuickAction(text: string) {
-    if (!session) {
-      console.log("Accion rapida ignorada: no hay sesion activa.");
+    unlockSpeechOutput();
+    stopRecognition("quick action");
+    let activeSession = session;
+
+    if (!activeSession) {
+      activeSession = await createSession({ shouldPlayWelcome: false });
+    }
+
+    if (!activeSession) {
       return;
     }
 
-    await sendChatMessage(text, session);
+    await sendChatMessage(text, activeSession);
   }
 
   function handleMicError(errorCode: string) {
     lastMicErrorRef.current = errorCode;
+    setLastRecognitionError(errorCode);
     setVoiceState("error");
 
     if (errorCode === "aborted") {
       console.log("SpeechRecognition abortado.");
       setVoiceState("idle");
       return;
+    }
+
+    if (errorCode === "network") {
+      networkErrorCountRef.current += 1;
+    } else {
+      networkErrorCountRef.current = 0;
     }
 
     const message =
@@ -683,35 +849,73 @@ export default function Home() {
           ? noVoiceMessage
         : notUnderstoodMessage;
 
-    setError(errorCode === "network" ? recognitionNetworkMessage : null);
+    if (errorCode === "network") {
+      setIsMicTemporarilyUnavailable(true);
+      setError(
+        `${temporaryVoiceUnavailableMessage}. ${recognitionNetworkMessage} Usa los botones rapidos o el modo prueba.`,
+      );
+
+      if (typeof window !== "undefined") {
+        if (micReenableTimeoutRef.current !== null) {
+          window.clearTimeout(micReenableTimeoutRef.current);
+        }
+
+        micReenableTimeoutRef.current = window.setTimeout(() => {
+          networkErrorCountRef.current = 0;
+          setIsMicTemporarilyUnavailable(false);
+          setError(null);
+        }, 30000);
+      }
+    } else {
+      setError(null);
+    }
+
     setConversation((entries) => [...entries, newEntry("assistant", message)]);
-    void speakAsLeo(message, () => setVoiceState("idle"));
+    void speak(message, { onEnd: () => setVoiceState("idle") });
+  }
+
+  function isSpeechOutputActive() {
+    return (
+      typeof window !== "undefined" &&
+      "speechSynthesis" in window &&
+      (window.speechSynthesis.speaking || window.speechSynthesis.pending)
+    );
   }
 
   function startRecognition(activeSession: Session) {
     const Recognition = getRecognitionConstructor();
 
-    window.speechSynthesis?.cancel();
+    if (isListeningRef.current || recognitionRef.current) {
+      console.log("SpeechRecognition ya esta escuchando.");
+      return;
+    }
+
+    if (isSpeakingRef.current || isSpeechOutputActive()) {
+      console.log("No se inicia SpeechRecognition: Luffy esta hablando.");
+      setVoiceState("speaking");
+      return;
+    }
 
     if (!Recognition) {
       setVoiceState("error");
+      setLastRecognitionError("unsupported");
       setConversation((entries) => [
         ...entries,
         newEntry("assistant", unsupportedRecognitionMessage),
       ]);
-      void speakAsLeo(unsupportedRecognitionMessage, () => setVoiceState("idle"));
+      void speak(unsupportedRecognitionMessage, {
+        onEnd: () => setVoiceState("idle"),
+      });
       return;
     }
 
-    stopRecognition("restarting recognition");
     finalTranscriptRef.current = "";
     lastMicErrorRef.current = null;
     ignoreNextEndRef.current = false;
     setHeardText("");
-    setVoiceState("processing");
 
     const recognition = new Recognition();
-    recognition.lang = getRecognitionLang();
+    recognition.lang = recognitionLang;
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.maxAlternatives = 3;
@@ -746,6 +950,7 @@ export default function Home() {
       if (finalText.trim()) {
         const normalizedTranscript = finalText.toLowerCase().trim();
         console.log("Texto reconocido:", normalizedTranscript);
+        networkErrorCountRef.current = 0;
         finalTranscriptRef.current = normalizedTranscript;
         ignoreNextEndRef.current = true;
         isListeningRef.current = false;
@@ -782,44 +987,54 @@ export default function Home() {
       }
 
       if (!finalTranscriptRef.current.trim()) {
+        if (isSendingMessageRef.current) {
+          return;
+        }
+
         setVoiceState("idle");
         setConversation((entries) => [
           ...entries,
           newEntry("assistant", noVoiceMessage),
         ]);
-        void speakAsLeo(`${noVoiceMessage} ${micOffMessage}`, () =>
-          setVoiceState("idle"),
-        );
+        void speak(`${noVoiceMessage} ${micOffMessage}`, {
+          onEnd: () => setVoiceState("idle"),
+        });
         return;
       }
 
       setVoiceState("idle");
-      void speakAsLeo(micOffMessage, () => setVoiceState("idle"));
     };
 
     recognitionRef.current = recognition;
 
-    void speakAsLeo(
-      micActivatedMessage,
-      () => {
-      try {
-        if (isListeningRef.current || isSpeakingRef.current) {
-          console.log("No se inicia SpeechRecognition: Leo sigue hablando o ya escucha.");
-          return;
-        }
-
-        recognition.start();
-      } catch {
-        handleMicError("start-failed");
-      }
-      },
-      { markAsSpeaking: false },
-    );
+    try {
+      recognition.start();
+    } catch {
+      recognitionRef.current = null;
+      handleMicError("start-failed");
+    }
   }
 
   async function handleMainTouch() {
-    if (isMicDisabled || isListeningRef.current || isSpeakingRef.current) {
-      console.log("Microfono bloqueado: Leo esta hablando, escuchando o procesando.");
+    unlockSpeechOutput();
+    void loadVoices();
+
+    if (isMicTemporarilyUnavailable) {
+      setVoiceState("error");
+      setError(
+        `${temporaryVoiceUnavailableMessage}. Usa los botones rapidos o el modo prueba.`,
+      );
+      return;
+    }
+
+    if (isSpeakingRef.current || isSpeechOutputActive()) {
+      console.log("Microfono bloqueado: Luffy esta hablando.");
+      setVoiceState("speaking");
+      return;
+    }
+
+    if (isMicDisabled || isListeningRef.current) {
+      console.log("Microfono bloqueado: escuchando o procesando.");
       return;
     }
 
@@ -827,9 +1042,14 @@ export default function Home() {
 
     if (!activeSession) {
       activeSession = await createSession();
-      if (!activeSession) {
-        return;
-      }
+      return;
+    }
+
+    const loadedItems = await ensureMenuLoaded();
+
+    if (!hasPlayedInitialMenuRef.current) {
+      await playWelcome(loadedItems);
+      return;
     }
 
     startRecognition(activeSession);
@@ -844,7 +1064,7 @@ export default function Home() {
               Menu por Voz
             </h1>
             <p className="mt-1 text-xl text-neutral-200">
-              Leo, tu mesero virtual
+              Luffy, tu mesero virtual
             </p>
             <p className="mt-1 text-base text-neutral-400">
               Restaurante Real
@@ -860,7 +1080,11 @@ export default function Home() {
             </div>
             <button
               type="button"
-              onClick={() => void createSession()}
+              onClick={() => {
+                unlockSpeechOutput();
+                void loadVoices();
+                void createSession();
+              }}
               disabled={isCreatingSession}
               className="min-h-12 rounded-md bg-emerald-300 px-4 text-lg font-semibold text-neutral-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-300"
             >
@@ -884,7 +1108,7 @@ export default function Home() {
               type="button"
               onClick={() => void handleMainTouch()}
               disabled={isMicDisabled}
-              aria-label="Toca para hablar con Leo"
+              aria-label="Toca para hablar con Luffy"
               className="relative flex flex-1 flex-col items-center justify-center overflow-hidden rounded-md border border-emerald-300/40 bg-black px-5 py-8 text-center outline-none transition hover:border-emerald-200 focus-visible:ring-4 focus-visible:ring-emerald-300 disabled:cursor-wait disabled:border-white/15"
             >
               {voiceState === "listening" ? (
@@ -925,10 +1149,10 @@ export default function Home() {
               </span>
 
               <p className="relative mt-8 text-4xl font-semibold sm:text-6xl">
-                {voiceStatus[voiceState].title}
+                {currentVoiceStatus.title}
               </p>
               <p className="relative mt-5 max-w-3xl text-2xl leading-10 text-neutral-200">
-                {voiceStatus[voiceState].helper}
+                {currentVoiceStatus.helper}
               </p>
 
               {heardText ? (
@@ -952,7 +1176,7 @@ export default function Home() {
 
           <aside className="grid gap-4">
             <SecondaryActions
-              disabled={!session || isCreatingSession || isSendingMessage}
+              disabled={isCreatingSession || isSendingMessage}
               onAction={(text) => void runQuickAction(text)}
             />
             <OrderPanel order={order} orderStatus={orderStatus} />
@@ -980,31 +1204,60 @@ export default function Home() {
           <ConversationPreview conversation={conversation} />
 
           {isTestModeOpen ? (
-            <form
-              onSubmit={submitMessage}
-              className="mt-4 grid gap-3 border-t border-white/10 pt-4 lg:grid-cols-[minmax(0,1fr)_180px]"
-            >
-              <label htmlFor="message" className="sr-only">
-                Mensaje de prueba
-              </label>
-              <textarea
-                id="message"
-                value={message}
-                onChange={(event) => setMessage(event.target.value)}
-                disabled={isChatDisabled}
-                rows={3}
-                maxLength={1000}
-                placeholder="Modo prueba: escribe una frase para POST /chat/message"
-                className="min-h-24 resize-y rounded-md border border-white/20 bg-black px-4 py-3 text-lg text-white outline-none placeholder:text-neutral-500 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-300/25 disabled:cursor-not-allowed disabled:bg-neutral-800"
-              />
-              <button
-                type="submit"
-                disabled={isChatDisabled || !message.trim()}
-                className="min-h-14 rounded-md bg-emerald-300 px-5 text-xl font-semibold text-neutral-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-300"
+            <div className="mt-4 border-t border-white/10 pt-4">
+              <div className="grid gap-3 md:grid-cols-3">
+                <p className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
+                  Voz seleccionada: {selectedVoiceLabel}
+                </p>
+                <label className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
+                  <span className="block text-sm uppercase text-neutral-500">
+                    Idioma de reconocimiento
+                  </span>
+                  <select
+                    value={recognitionLang}
+                    onChange={(event) =>
+                      setRecognitionLang(event.target.value as RecognitionLanguage)
+                    }
+                    disabled={voiceState === "listening"}
+                    className="mt-2 w-full rounded-md border border-white/20 bg-neutral-950 px-3 py-2 text-lg text-white outline-none focus:border-emerald-300 disabled:cursor-not-allowed disabled:text-neutral-500"
+                  >
+                    {recognitionLanguageOptions.map((language) => (
+                      <option key={language} value={language}>
+                        {language}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
+                  Ultimo error SpeechRecognition: {lastRecognitionError}
+                </p>
+              </div>
+              <form
+                onSubmit={submitMessage}
+                className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_180px]"
               >
-                {isSendingMessage ? "Enviando..." : "Enviar"}
-              </button>
-            </form>
+                <label htmlFor="message" className="sr-only">
+                  Mensaje de prueba
+                </label>
+                <textarea
+                  id="message"
+                  value={message}
+                  onChange={(event) => setMessage(event.target.value)}
+                  disabled={isChatDisabled}
+                  rows={3}
+                  maxLength={1000}
+                  placeholder="Modo prueba: escribe una frase para POST /chat/message"
+                  className="min-h-24 resize-y rounded-md border border-white/20 bg-black px-4 py-3 text-lg text-white outline-none placeholder:text-neutral-500 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-300/25 disabled:cursor-not-allowed disabled:bg-neutral-800"
+                />
+                <button
+                  type="submit"
+                  disabled={isChatDisabled || !message.trim()}
+                  className="min-h-14 rounded-md bg-emerald-300 px-5 text-xl font-semibold text-neutral-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-300"
+                >
+                  {isSendingMessage ? "Enviando..." : "Enviar"}
+                </button>
+              </form>
+            </div>
           ) : null}
 
           {clientReady && !speechSupported ? (
@@ -1060,7 +1313,7 @@ function ConversationPreview({
     <div className="mt-4 grid gap-3 md:grid-cols-2">
       {visibleEntries.length === 0 ? (
         <p className="rounded-md border border-white/10 bg-black p-4 text-lg text-neutral-300">
-          Al iniciar la sesion, Leo dara la bienvenida por voz.
+          Al iniciar la sesion, Luffy dara la bienvenida por voz.
         </p>
       ) : (
         visibleEntries.map((entry) => (
@@ -1073,7 +1326,7 @@ function ConversationPreview({
             }
           >
             <p className="text-sm font-semibold uppercase tracking-wide opacity-75">
-              {entry.role === "user" ? "Cliente" : "Leo"}
+              {entry.role === "user" ? "Cliente" : "Luffy"}
             </p>
             <p className="mt-2 text-lg leading-7">{entry.text}</p>
           </div>
