@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   interaction_role,
   order_event_type,
@@ -6,12 +6,15 @@ import {
   session_status,
 } from '../../../generated/prisma/enums';
 import { Prisma } from '../../../generated/prisma/client';
+import { AiInterpretation, AiService } from '../ai/ai.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   ChatIntent,
   ChatMessageResponseDto,
 } from './dto/chat-message-response.dto';
 import { SendChatMessageDto } from './dto/send-chat-message.dto';
+
+const minimumAiConfidence = 0.6;
 
 const orderInclude = {
   order_items: {
@@ -36,11 +39,18 @@ type TxClient = Prisma.TransactionClient;
 
 @Injectable()
 export class ChatService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(ChatService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly aiService: AiService,
+  ) {}
 
   async handleMessage(
     dto: SendChatMessageDto,
   ): Promise<ChatMessageResponseDto> {
+    const aiInterpretation = await this.interpretWithAi(dto.message);
+
     return this.prisma.$transaction(
       async (tx) => {
         await this.assertActiveSession(tx, dto.sessionId);
@@ -52,15 +62,25 @@ export class ChatService {
         );
 
         let order = await this.getOrCreateDraftOrder(tx, dto.sessionId);
-        const intent = this.detectIntent(dto.message);
+        const intent = this.resolveIntent(dto.message, aiInterpretation);
         let assistantMessage: string;
 
         if (intent === 'ADD_ITEM') {
-          const result = await this.addRequestedItem(tx, order, dto.message);
+          const result = await this.addRequestedItem(
+            tx,
+            order,
+            dto.message,
+            aiInterpretation,
+          );
           order = result.order;
           assistantMessage = result.assistantMessage;
         } else if (intent === 'REMOVE_ITEM') {
-          const result = await this.removeRequestedItem(tx, order, dto.message);
+          const result = await this.removeRequestedItem(
+            tx,
+            order,
+            dto.message,
+            aiInterpretation,
+          );
           order = result.order;
           assistantMessage = result.assistantMessage;
         } else if (intent === 'CONFIRM_ORDER') {
@@ -96,6 +116,118 @@ export class ChatService {
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
+  }
+
+  private async interpretWithAi(
+    message: string,
+  ): Promise<AiInterpretation | null> {
+    const context = await this.buildAiContext();
+
+    return this.aiService.interpretMessage(message, context);
+  }
+
+  private async buildAiContext(): Promise<object> {
+    const [categories, items] = await Promise.all([
+      this.prisma.categories.findMany({
+        where: { is_active: true },
+        select: { name: true },
+        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+      }),
+      this.prisma.menu_items.findMany({
+        where: {
+          is_active: true,
+          is_available: true,
+          categories: {
+            is_active: true,
+          },
+        },
+        select: {
+          name: true,
+          search_aliases: true,
+          categories: {
+            select: { name: true },
+          },
+        },
+        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+      }),
+    ]);
+
+    return {
+      supportedIntents: [
+        'ADD_ITEM',
+        'REMOVE_ITEM',
+        'MENU_CATEGORIES',
+        'ORDER_SUMMARY',
+        'CONFIRM_ORDER',
+        'UNKNOWN',
+      ],
+      categories: categories.map((category) => category.name),
+      menuItems: items.map((item) => ({
+        name: item.name,
+        aliases: item.search_aliases,
+        categoryName: item.categories.name,
+      })),
+    };
+  }
+
+  private resolveIntent(
+    message: string,
+    aiInterpretation: AiInterpretation | null,
+  ): ChatIntent {
+    const ruleIntent = this.detectIntent(message);
+
+    if (
+      aiInterpretation &&
+      aiInterpretation.confidence >= minimumAiConfidence
+    ) {
+      if (
+        aiInterpretation.intent === 'CONFIRM_ORDER' &&
+        ruleIntent !== 'CONFIRM_ORDER'
+      ) {
+        this.logger.warn(
+          'AI interpretation returned CONFIRM_ORDER without explicit rule confirmation; using fallback',
+        );
+        return ruleIntent;
+      }
+
+      return aiInterpretation.intent;
+    }
+
+    return ruleIntent;
+  }
+
+  private resolveQuantity(aiInterpretation: AiInterpretation | null): number {
+    if (
+      aiInterpretation &&
+      aiInterpretation.intent === 'ADD_ITEM' &&
+      aiInterpretation.confidence >= minimumAiConfidence &&
+      aiInterpretation.quantity
+    ) {
+      return aiInterpretation.quantity;
+    }
+
+    return 1;
+  }
+
+  private itemLookupMessages(
+    message: string,
+    aiInterpretation: AiInterpretation | null,
+    intent: 'ADD_ITEM' | 'REMOVE_ITEM',
+  ): string[] {
+    const messages: string[] = [];
+
+    if (
+      aiInterpretation &&
+      aiInterpretation.intent === intent &&
+      aiInterpretation.confidence >= minimumAiConfidence &&
+      aiInterpretation.productName
+    ) {
+      messages.push(aiInterpretation.productName);
+    }
+
+    messages.push(message);
+
+    return Array.from(new Set(messages));
   }
 
   private detectIntent(message: string): ChatIntent {
@@ -226,8 +358,13 @@ export class ChatService {
     tx: TxClient,
     order: OrderWithItems,
     message: string,
+    aiInterpretation: AiInterpretation | null,
   ): Promise<{ order: OrderWithItems; assistantMessage: string }> {
-    const matches = await this.findMatchingMenuItems(tx, message);
+    const requestedQuantity = this.resolveQuantity(aiInterpretation);
+    const matches = await this.findMatchingMenuItems(
+      tx,
+      this.itemLookupMessages(message, aiInterpretation, 'ADD_ITEM'),
+    );
 
     if (matches.length === 0) {
       return {
@@ -266,8 +403,8 @@ export class ChatService {
         item_name_snapshot: item.name,
         variant_name_snapshot: defaultVariant.name,
         unit_price_snapshot: defaultVariant.price,
-        quantity: 1,
-        line_total: defaultVariant.price,
+        quantity: requestedQuantity,
+        line_total: defaultVariant.price.mul(requestedQuantity),
       },
     });
 
@@ -275,7 +412,7 @@ export class ChatService {
     await this.createOrderEvent(tx, order.id, order_event_type.ADD_ITEM, {
       itemId: createdItem.id,
       variantId: defaultVariant.id,
-      quantity: 1,
+      quantity: requestedQuantity,
       source: 'CHAT_MESSAGE',
     });
 
@@ -283,7 +420,7 @@ export class ChatService {
 
     return {
       order: updatedOrder,
-      assistantMessage: `Agregue 1 ${item.name} a tu pedido. Total actual: ${this.formatMoney(
+      assistantMessage: `Agregue ${requestedQuantity} ${item.name} a tu pedido. Total actual: ${this.formatMoney(
         updatedOrder.total,
       )}.`,
     };
@@ -293,6 +430,7 @@ export class ChatService {
     tx: TxClient,
     order: OrderWithItems,
     message: string,
+    aiInterpretation: AiInterpretation | null,
   ): Promise<{ order: OrderWithItems; assistantMessage: string }> {
     if (order.order_items.length === 0) {
       return {
@@ -301,7 +439,10 @@ export class ChatService {
       };
     }
 
-    const matches = this.findMatchingOrderItems(order, message);
+    const matches = this.findMatchingOrderItems(
+      order,
+      this.itemLookupMessages(message, aiInterpretation, 'REMOVE_ITEM'),
+    );
 
     if (matches.length === 0) {
       return {
@@ -341,7 +482,7 @@ export class ChatService {
 
   private async findMatchingMenuItems(
     tx: TxClient,
-    message: string,
+    messages: string[],
   ): Promise<MenuItemWithVariants[]> {
     const items = await tx.menu_items.findMany({
       where: {
@@ -364,19 +505,33 @@ export class ChatService {
       orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
     });
 
-    const normalizedMessage = this.normalize(message);
-    const messageTokens = this.toMeaningfulTokens(normalizedMessage);
-    const matches: ScoredMenuItemMatch[] = items
-      .map((item) => ({
-        item,
-        score: this.scoreMenuItemMatch(
+    const matchesByItemId = new Map<string, ScoredMenuItemMatch>();
+
+    for (const message of messages) {
+      const normalizedMessage = this.normalize(message);
+      const messageTokens = this.toMeaningfulTokens(normalizedMessage);
+
+      for (const item of items) {
+        const score = this.scoreMenuItemMatch(
           item,
           normalizedMessage,
           messageTokens,
           items,
-        ),
-      }))
-      .filter((match) => match.score > 0);
+        );
+
+        if (score === 0) {
+          continue;
+        }
+
+        const existingMatch = matchesByItemId.get(item.id);
+
+        if (!existingMatch || existingMatch.score < score) {
+          matchesByItemId.set(item.id, { item, score });
+        }
+      }
+    }
+
+    const matches = Array.from(matchesByItemId.values());
 
     if (matches.length === 0) {
       return [];
@@ -391,10 +546,12 @@ export class ChatService {
 
   private findMatchingOrderItems(
     order: OrderWithItems,
-    message: string,
+    messages: string[],
   ): OrderWithItems['order_items'] {
     return order.order_items.filter((item) =>
-      this.itemMatchesMessage(message, [item.item_name_snapshot]),
+      messages.some((message) =>
+        this.itemMatchesMessage(message, [item.item_name_snapshot]),
+      ),
     );
   }
 
@@ -543,11 +700,7 @@ export class ChatService {
       return nameScore;
     }
 
-    const aliasScore = this.bestAliasScore(
-      item,
-      normalizedMessage,
-      allItems,
-    );
+    const aliasScore = this.bestAliasScore(item, normalizedMessage, allItems);
     const broadScore = this.matchesByUserTokens(messageTokens, [
       item.name,
       ...item.search_aliases,

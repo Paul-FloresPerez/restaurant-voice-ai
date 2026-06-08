@@ -65,12 +65,11 @@ type Order = {
 };
 
 type VoiceState =
-  | "start"
-  | "off"
-  | "activating"
+  | "idle"
   | "listening"
   | "processing"
-  | "speaking";
+  | "speaking"
+  | "error";
 
 type SpeechRecognitionAlternativeLike = {
   transcript: string;
@@ -131,6 +130,8 @@ const noPermissionMessage =
   "No tengo permiso para usar el microfono. Activa el permiso del navegador o usa el modo prueba.";
 const noAudioCaptureMessage =
   "No encuentro un microfono disponible. Revisa el dispositivo de audio o usa el modo prueba.";
+const recognitionNetworkMessage =
+  "Hubo un problema con el reconocimiento de voz. Toca nuevamente para intentarlo.";
 const notUnderstoodMessage =
   "No pude entenderte. Puedes decir: leer carta, bebidas, comida o repetir mi pedido.";
 const unsupportedRecognitionMessage =
@@ -146,17 +147,9 @@ const quickActions = [
 ];
 
 const voiceStatus: Record<VoiceState, { title: string; helper: string }> = {
-  start: {
+  idle: {
     title: "Toca para hablar",
     helper: "Leo iniciara la sesion y te guiara paso a paso.",
-  },
-  off: {
-    title: "Microfono apagado",
-    helper: "Toca el centro de la pantalla para hablar con Leo.",
-  },
-  activating: {
-    title: "Microfono activado",
-    helper: "Leo esta preparando la escucha.",
   },
   listening: {
     title: "Escuchando...",
@@ -164,11 +157,15 @@ const voiceStatus: Record<VoiceState, { title: string; helper: string }> = {
   },
   processing: {
     title: "Procesando solicitud...",
-    helper: "Leo esta enviando tu mensaje al sistema del restaurante.",
+    helper: "Leo esta preparando o enviando tu solicitud.",
   },
   speaking: {
     title: "Leo esta respondiendo",
     helper: "Escucha la respuesta. Luego toca otra vez para hablar.",
+  },
+  error: {
+    title: "Problema de voz",
+    helper: "El flujo esta listo para intentar nuevamente.",
   },
 };
 
@@ -301,7 +298,7 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [order, setOrder] = useState<Order | null>(null);
   const [orderStatus, setOrderStatus] = useState("Sin pedido activo.");
-  const [voiceState, setVoiceState] = useState<VoiceState>("start");
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [heardText, setHeardText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
@@ -320,6 +317,7 @@ export default function Home() {
   const isSpeakingRef = useRef(false);
   const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const speechRunIdRef = useRef(0);
+  const speechTimeoutRef = useRef<number | null>(null);
 
   const groupedMenu = useMemo(() => {
     return menuItems.reduce<Record<string, MenuItem[]>>((groups, item) => {
@@ -399,6 +397,11 @@ export default function Home() {
       console.log("Voz de Leo: se cancelo una locucion previa para evitar duplicados.");
     }
 
+    if (speechTimeoutRef.current !== null) {
+      window.clearTimeout(speechTimeoutRef.current);
+      speechTimeoutRef.current = null;
+    }
+
     const runId = speechRunIdRef.current + 1;
     const shouldMarkAsSpeaking = options.markAsSpeaking ?? true;
     speechRunIdRef.current = runId;
@@ -419,9 +422,21 @@ export default function Home() {
       utterance.voice = stableVoice;
     }
 
+    let hasFinished = false;
     const finish = () => {
+      if (hasFinished) {
+        return;
+      }
+
+      hasFinished = true;
+
       if (speechRunIdRef.current !== runId) {
         return;
+      }
+
+      if (speechTimeoutRef.current !== null) {
+        window.clearTimeout(speechTimeoutRef.current);
+        speechTimeoutRef.current = null;
       }
 
       isSpeakingRef.current = false;
@@ -429,7 +444,18 @@ export default function Home() {
     };
 
     utterance.onend = finish;
-    utterance.onerror = finish;
+    utterance.onerror = (event) => {
+      console.log("speechSynthesis error:", event.error);
+      finish();
+    };
+    speechTimeoutRef.current = window.setTimeout(
+      () => {
+        console.log("speechSynthesis timeout de seguridad.");
+        window.speechSynthesis.cancel();
+        finish();
+      },
+      Math.min(25000, Math.max(5000, text.length * 85)),
+    );
     window.speechSynthesis.speak(utterance);
   }
 
@@ -482,6 +508,11 @@ export default function Home() {
     return () => {
       window.cancelAnimationFrame(frameId);
       stopRecognition("component cleanup");
+      if (speechTimeoutRef.current !== null) {
+        window.clearTimeout(speechTimeoutRef.current);
+        speechTimeoutRef.current = null;
+      }
+      isSpeakingRef.current = false;
       window.speechSynthesis?.cancel();
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.onvoiceschanged = null;
@@ -523,13 +554,13 @@ export default function Home() {
           newEntry("assistant", categoryMessage),
         ]);
         void speakAsLeo(`${leoIntro} ${categoryMessage}`, () =>
-          setVoiceState("off"),
+          setVoiceState("idle"),
         );
       }
 
       return createdSession;
     } catch (requestError) {
-      setVoiceState("start");
+      setVoiceState("error");
       setError(
         requestError instanceof Error
           ? requestError.message
@@ -588,20 +619,22 @@ export default function Home() {
         newEntry("assistant", response.assistantMessage),
       ]);
       void speakAsLeo(response.assistantMessage, () => {
-        setVoiceState("off");
+        setVoiceState("idle");
       });
     } catch (requestError) {
       const errorMessage =
         requestError instanceof Error
           ? requestError.message
           : "No se pudo enviar el mensaje.";
+      const spokenError = `Leo tuvo un problema enviando tu mensaje. ${errorMessage}. Toca nuevamente para intentarlo.`;
       setError(errorMessage);
-      setVoiceState("off");
+      setVoiceState("error");
       setConversation((entries) => [
         ...entries,
-        newEntry("assistant", `Leo: ${errorMessage}`),
+        newEntry("assistant", spokenError),
       ]);
       await loadCurrentOrder(targetSession.id);
+      void speakAsLeo(spokenError, () => setVoiceState("idle"));
     } finally {
       setIsSendingMessage(false);
     }
@@ -631,15 +664,18 @@ export default function Home() {
 
   function handleMicError(errorCode: string) {
     lastMicErrorRef.current = errorCode;
-    setVoiceState("off");
+    setVoiceState("error");
 
     if (errorCode === "aborted") {
       console.log("SpeechRecognition abortado.");
+      setVoiceState("idle");
       return;
     }
 
     const message =
-      errorCode === "not-allowed" || errorCode === "service-not-allowed"
+      errorCode === "network"
+        ? recognitionNetworkMessage
+        : errorCode === "not-allowed" || errorCode === "service-not-allowed"
         ? noPermissionMessage
         : errorCode === "audio-capture"
           ? noAudioCaptureMessage
@@ -647,8 +683,9 @@ export default function Home() {
           ? noVoiceMessage
         : notUnderstoodMessage;
 
+    setError(errorCode === "network" ? recognitionNetworkMessage : null);
     setConversation((entries) => [...entries, newEntry("assistant", message)]);
-    void speakAsLeo(message);
+    void speakAsLeo(message, () => setVoiceState("idle"));
   }
 
   function startRecognition(activeSession: Session) {
@@ -657,21 +694,21 @@ export default function Home() {
     window.speechSynthesis?.cancel();
 
     if (!Recognition) {
-      setVoiceState("off");
+      setVoiceState("error");
       setConversation((entries) => [
         ...entries,
         newEntry("assistant", unsupportedRecognitionMessage),
       ]);
-      void speakAsLeo(unsupportedRecognitionMessage);
+      void speakAsLeo(unsupportedRecognitionMessage, () => setVoiceState("idle"));
       return;
     }
 
-    recognitionRef.current?.abort();
+    stopRecognition("restarting recognition");
     finalTranscriptRef.current = "";
     lastMicErrorRef.current = null;
     ignoreNextEndRef.current = false;
     setHeardText("");
-    setVoiceState("activating");
+    setVoiceState("processing");
 
     const recognition = new Recognition();
     recognition.lang = getRecognitionLang();
@@ -721,6 +758,16 @@ export default function Home() {
       console.log("SpeechRecognition error:", event.error);
       ignoreNextEndRef.current = true;
       isListeningRef.current = false;
+      recognition.onstart = null;
+      recognition.onresult = null;
+      recognition.onerror = null;
+      recognition.onend = null;
+      recognitionRef.current = null;
+      try {
+        recognition.abort();
+      } catch {
+        console.log("SpeechRecognition abort no disponible tras error.");
+      }
       handleMicError(event.error);
     };
 
@@ -735,17 +782,19 @@ export default function Home() {
       }
 
       if (!finalTranscriptRef.current.trim()) {
-        setVoiceState("off");
+        setVoiceState("idle");
         setConversation((entries) => [
           ...entries,
           newEntry("assistant", noVoiceMessage),
         ]);
-        void speakAsLeo(`${noVoiceMessage} ${micOffMessage}`);
+        void speakAsLeo(`${noVoiceMessage} ${micOffMessage}`, () =>
+          setVoiceState("idle"),
+        );
         return;
       }
 
-      setVoiceState("off");
-      void speakAsLeo(micOffMessage);
+      setVoiceState("idle");
+      void speakAsLeo(micOffMessage, () => setVoiceState("idle"));
     };
 
     recognitionRef.current = recognition;

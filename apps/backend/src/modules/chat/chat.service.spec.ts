@@ -3,11 +3,12 @@ import { ChatService } from './chat.service';
 type FindMatchingMenuItems = {
   findMatchingMenuItems(
     tx: { menu_items: { findMany: jest.Mock } },
-    message: string,
+    messages: string[],
   ): Promise<Array<{ name: string }>>;
 };
 
-const menuItem = (name: string, searchAliases: string[]) => ({
+const menuItem = (id: string, name: string, searchAliases: string[]) => ({
+  id,
   name,
   search_aliases: searchAliases,
   menu_item_variants: [],
@@ -15,17 +16,17 @@ const menuItem = (name: string, searchAliases: string[]) => ({
 
 describe('ChatService product matching', () => {
   const items = [
-    menuItem('Hamburguesa Clasica', [
+    menuItem('classic-burger', 'Hamburguesa Clasica', [
       'hamburguesa',
       'clasica',
       'burger clasica',
     ]),
-    menuItem('Hamburguesa Doble Carne', [
+    menuItem('double-burger', 'Hamburguesa Doble Carne', [
       'doble',
       'doble carne',
       'burger doble',
     ]),
-    menuItem('Hamburguesa Vegetariana', [
+    menuItem('veggie-burger', 'Hamburguesa Vegetariana', [
       'vegetariana',
       'veggie',
       'hamburguesa vegetal',
@@ -35,6 +36,7 @@ describe('ChatService product matching', () => {
   const findMatches = async (message: string) => {
     const service = new ChatService(
       {} as ConstructorParameters<typeof ChatService>[0],
+      {} as ConstructorParameters<typeof ChatService>[1],
     ) as unknown as FindMatchingMenuItems;
     const tx = {
       menu_items: {
@@ -42,7 +44,7 @@ describe('ChatService product matching', () => {
       },
     };
 
-    return service.findMatchingMenuItems(tx, message);
+    return service.findMatchingMenuItems(tx, [message]);
   };
 
   it('prioritizes the full product name over broad aliases', async () => {
