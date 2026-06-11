@@ -26,7 +26,7 @@ export class VoiceController {
   receiveMessage(
     @Body() dto: VoiceMessageDto,
     @UploadedFile() file: UploadedAudioFile | undefined,
-  ): VoiceMessageResponseDto {
+  ): Promise<VoiceMessageResponseDto> {
     return this.voiceService.receiveAudio(dto, file);
   }
 }

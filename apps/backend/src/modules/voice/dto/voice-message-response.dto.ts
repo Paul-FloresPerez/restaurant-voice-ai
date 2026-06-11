@@ -1,11 +1,10 @@
-export class VoiceFileInfoResponseDto {
-  originalName: string;
-  mimeType: string;
-  size: number;
-}
+import { OrderResponseDto } from '../../order/dto/order-response.dto';
+import { ChatIntent } from '../../chat/dto/chat-message-response.dto';
 
 export class VoiceMessageResponseDto {
-  message: string;
   sessionId: string;
-  fileInfo: VoiceFileInfoResponseDto;
+  transcription: string;
+  intent: ChatIntent;
+  assistantMessage: string;
+  order: OrderResponseDto;
 }

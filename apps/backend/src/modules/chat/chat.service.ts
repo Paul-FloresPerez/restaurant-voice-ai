@@ -1,4 +1,5 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { performance } from 'node:perf_hooks';
 import {
   interaction_role,
   order_event_type,
@@ -6,7 +7,12 @@ import {
   session_status,
 } from '../../../generated/prisma/enums';
 import { Prisma } from '../../../generated/prisma/client';
-import { AiInterpretation, AiService } from '../ai/ai.service';
+import {
+  AiConfirmationType,
+  AiInterpretation,
+  AiService,
+} from '../ai/ai.service';
+import { OrderResponseDto } from '../order/dto/order-response.dto';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   ChatIntent,
@@ -36,6 +42,13 @@ type ScoredMenuItemMatch = {
   score: number;
 };
 type TxClient = Prisma.TransactionClient;
+type RuleIntentResult = {
+  intent: ChatIntent;
+  confirmationType: AiConfirmationType | null;
+};
+export type ChatProcessingTelemetry = {
+  aiMs?: number;
+};
 
 @Injectable()
 export class ChatService {
@@ -48,8 +61,13 @@ export class ChatService {
 
   async handleMessage(
     dto: SendChatMessageDto,
+    telemetry?: ChatProcessingTelemetry,
   ): Promise<ChatMessageResponseDto> {
-    const aiInterpretation = await this.interpretWithAi(dto.message);
+    const aiInterpretation = await this.interpretWithAi(
+      dto.sessionId,
+      dto.message,
+      telemetry,
+    );
 
     return this.prisma.$transaction(
       async (tx) => {
@@ -62,7 +80,15 @@ export class ChatService {
         );
 
         let order = await this.getOrCreateDraftOrder(tx, dto.sessionId);
+        const lastAssistantMessage = await this.findLastAssistantMessage(
+          tx,
+          dto.sessionId,
+        );
         const intent = this.resolveIntent(dto.message, aiInterpretation);
+        const confirmationType = this.resolveConfirmationType(
+          dto.message,
+          aiInterpretation,
+        );
         let assistantMessage: string;
 
         if (intent === 'ADD_ITEM') {
@@ -86,18 +112,34 @@ export class ChatService {
         } else if (intent === 'CONFIRM_ORDER') {
           if (order.order_items.length === 0) {
             assistantMessage =
-              'No puedo confirmar un pedido vacio. Primero agrega al menos un producto.';
+              'Aún no hay productos para confirmar. Dime qué deseas agregar.';
+          } else if (
+            confirmationType !== 'explicit' ||
+            !this.isFinalConfirmationPrompt(lastAssistantMessage)
+          ) {
+            assistantMessage = this.buildFinalConfirmationPrompt(order);
           } else {
             order = await this.confirmDraftOrder(tx, order.id);
             assistantMessage = this.buildConfirmedOrderMessage(order);
           }
         } else if (intent === 'ORDER_SUMMARY') {
           assistantMessage = this.buildOrderSummaryMessage(order);
-        } else if (intent === 'MENU_CATEGORIES') {
+        } else if (
+          intent === 'READ_MENU' ||
+          intent === 'CATEGORY_QUERY' ||
+          intent === 'MENU_CATEGORIES'
+        ) {
           assistantMessage = await this.buildMenuCategoriesMessage(tx);
+        } else if (intent === 'AFFIRMATION') {
+          assistantMessage =
+            order.order_items.length > 0
+              ? this.buildFinalConfirmationPrompt(order)
+              : 'Claro. ¿Qué te gustaría agregar?';
+        } else if (intent === 'NEGATION') {
+          assistantMessage = 'De acuerdo, no confirmo. ¿Quieres cambiar algo?';
         } else {
           assistantMessage =
-            'Estoy en modo prueba. Puedes pedirme el menu, el resumen de tu pedido o confirmar tu pedido.';
+            'No estoy seguro de qué producto deseas. Puedo leerte hamburguesas, bebidas, extras o postres.';
         }
 
         await this.createInteractionLog(
@@ -112,6 +154,7 @@ export class ChatService {
           orderId: order.id,
           intent,
           assistantMessage,
+          order: this.toOrderResponse(order),
         };
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
@@ -119,48 +162,89 @@ export class ChatService {
   }
 
   private async interpretWithAi(
+    sessionId: string,
     message: string,
+    telemetry?: ChatProcessingTelemetry,
   ): Promise<AiInterpretation | null> {
-    const context = await this.buildAiContext();
+    const context = await this.buildAiContext(sessionId, message);
+    const aiStartedAt = performance.now();
 
-    return this.aiService.interpretMessage(message, context);
+    try {
+      return await this.aiService.interpretMessage(message, context);
+    } finally {
+      if (telemetry) {
+        telemetry.aiMs = this.elapsedMs(aiStartedAt);
+      }
+    }
   }
 
-  private async buildAiContext(): Promise<object> {
-    const [categories, items] = await Promise.all([
-      this.prisma.categories.findMany({
-        where: { is_active: true },
-        select: { name: true },
-        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
-      }),
-      this.prisma.menu_items.findMany({
-        where: {
-          is_active: true,
-          is_available: true,
-          categories: {
+  private async buildAiContext(
+    sessionId: string,
+    message: string,
+  ): Promise<object> {
+    const [categories, items, currentOrder, lastAssistantLog] =
+      await Promise.all([
+        this.prisma.categories.findMany({
+          where: { is_active: true },
+          select: { name: true },
+          orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+        }),
+        this.prisma.menu_items.findMany({
+          where: {
             is_active: true,
+            is_available: true,
+            categories: {
+              is_active: true,
+            },
           },
-        },
-        select: {
-          name: true,
-          search_aliases: true,
-          categories: {
-            select: { name: true },
+          select: {
+            name: true,
+            search_aliases: true,
+            categories: {
+              select: { name: true },
+            },
           },
-        },
-        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
-      }),
-    ]);
+          orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+        }),
+        this.prisma.orders.findFirst({
+          where: {
+            session_id: sessionId,
+            status: order_status.DRAFT,
+          },
+          include: orderInclude,
+          orderBy: { created_at: 'desc' },
+        }),
+        this.prisma.interaction_logs.findFirst({
+          where: {
+            session_id: sessionId,
+            role: interaction_role.ASSISTANT,
+          },
+          select: { message: true },
+          orderBy: { created_at: 'desc' },
+        }),
+      ]);
 
     return {
+      currentMessage: message,
       supportedIntents: [
         'ADD_ITEM',
         'REMOVE_ITEM',
-        'MENU_CATEGORIES',
+        'READ_MENU',
+        'CATEGORY_QUERY',
         'ORDER_SUMMARY',
         'CONFIRM_ORDER',
+        'AFFIRMATION',
+        'NEGATION',
         'UNKNOWN',
       ],
+      currentOrder: currentOrder
+        ? this.toAiOrderContext(currentOrder)
+        : {
+            status: order_status.DRAFT,
+            items: [],
+            total: '0',
+          },
+      lastAssistantMessage: lastAssistantLog?.message ?? null,
       categories: categories.map((category) => category.name),
       menuItems: items.map((item) => ({
         name: item.name,
@@ -170,30 +254,88 @@ export class ChatService {
     };
   }
 
+  private toAiOrderContext(order: OrderWithItems): object {
+    return {
+      status: order.status,
+      total: order.total.toString(),
+      items: order.order_items.map((item) => ({
+        productName: item.item_name_snapshot,
+        variantName: item.variant_name_snapshot,
+        quantity: item.quantity,
+        lineTotal: item.line_total.toString(),
+        modifiers: item.order_item_modifiers.map((modifier) => ({
+          groupName: modifier.group_name_snapshot,
+          optionName: modifier.option_name_snapshot,
+          priceDelta: modifier.price_delta_snapshot.toString(),
+          quantity: modifier.quantity,
+        })),
+      })),
+    };
+  }
+
   private resolveIntent(
     message: string,
     aiInterpretation: AiInterpretation | null,
   ): ChatIntent {
-    const ruleIntent = this.detectIntent(message);
+    const ruleIntent = this.detectIntentDetails(message);
+
+    if (this.isConversationalControlIntent(ruleIntent.intent)) {
+      return ruleIntent.intent;
+    }
 
     if (
       aiInterpretation &&
       aiInterpretation.confidence >= minimumAiConfidence
     ) {
-      if (
-        aiInterpretation.intent === 'CONFIRM_ORDER' &&
-        ruleIntent !== 'CONFIRM_ORDER'
-      ) {
-        this.logger.warn(
-          'AI interpretation returned CONFIRM_ORDER without explicit rule confirmation; using fallback',
-        );
-        return ruleIntent;
-      }
-
-      return aiInterpretation.intent;
+      return this.normalizeAiIntent(aiInterpretation.intent);
     }
 
-    return ruleIntent;
+    return ruleIntent.intent;
+  }
+
+  private resolveConfirmationType(
+    message: string,
+    aiInterpretation: AiInterpretation | null,
+  ): AiConfirmationType | null {
+    const ruleIntent = this.detectIntentDetails(message);
+
+    if (ruleIntent.confirmationType) {
+      return ruleIntent.confirmationType;
+    }
+
+    if (
+      aiInterpretation &&
+      aiInterpretation.confidence >= minimumAiConfidence &&
+      this.normalizeAiIntent(aiInterpretation.intent) === 'CONFIRM_ORDER' &&
+      aiInterpretation.confirmationType
+    ) {
+      return aiInterpretation.confirmationType === 'explicit'
+        ? 'closure'
+        : aiInterpretation.confirmationType;
+    }
+
+    if (
+      aiInterpretation &&
+      aiInterpretation.confidence >= minimumAiConfidence &&
+      this.normalizeAiIntent(aiInterpretation.intent) === 'AFFIRMATION'
+    ) {
+      return 'ambiguous';
+    }
+
+    return null;
+  }
+
+  private normalizeAiIntent(intent: AiInterpretation['intent']): ChatIntent {
+    return intent === 'MENU_CATEGORIES' ? 'READ_MENU' : intent;
+  }
+
+  private isConversationalControlIntent(intent: ChatIntent): boolean {
+    return [
+      'CONFIRM_ORDER',
+      'AFFIRMATION',
+      'NEGATION',
+      'ORDER_SUMMARY',
+    ].includes(intent);
   }
 
   private resolveQuantity(aiInterpretation: AiInterpretation | null): number {
@@ -230,11 +372,15 @@ export class ChatService {
     return Array.from(new Set(messages));
   }
 
-  private detectIntent(message: string): ChatIntent {
+  private detectIntentDetails(message: string): RuleIntentResult {
     const normalizedMessage = this.normalize(message);
 
-    if (this.containsAny(normalizedMessage, ['confirmar', 'confirmo'])) {
-      return 'CONFIRM_ORDER';
+    if (this.isExplicitConfirmation(normalizedMessage)) {
+      return { intent: 'CONFIRM_ORDER', confirmationType: 'explicit' };
+    }
+
+    if (this.isClosureConfirmation(normalizedMessage)) {
+      return { intent: 'CONFIRM_ORDER', confirmationType: 'closure' };
     }
 
     if (
@@ -245,11 +391,27 @@ export class ChatService {
         'que pedi',
       ])
     ) {
-      return 'ORDER_SUMMARY';
+      return { intent: 'ORDER_SUMMARY', confirmationType: null };
     }
 
     if (this.containsAny(normalizedMessage, ['quita', 'elimina'])) {
-      return 'REMOVE_ITEM';
+      return { intent: 'REMOVE_ITEM', confirmationType: null };
+    }
+
+    if (this.isNegation(normalizedMessage)) {
+      return { intent: 'NEGATION', confirmationType: null };
+    }
+
+    if (
+      this.containsAny(normalizedMessage, [
+        'categoria',
+        'categorias',
+        'bebidas',
+        'postres',
+        'combos',
+      ])
+    ) {
+      return { intent: 'CATEGORY_QUERY', confirmationType: null };
     }
 
     if (
@@ -260,7 +422,7 @@ export class ChatService {
         'que hay',
       ])
     ) {
-      return 'MENU_CATEGORIES';
+      return { intent: 'READ_MENU', confirmationType: null };
     }
 
     if (
@@ -272,10 +434,14 @@ export class ChatService {
         'dame',
       ])
     ) {
-      return 'ADD_ITEM';
+      return { intent: 'ADD_ITEM', confirmationType: null };
     }
 
-    return 'UNKNOWN';
+    if (this.isAffirmation(normalizedMessage)) {
+      return { intent: 'AFFIRMATION', confirmationType: 'ambiguous' };
+    }
+
+    return { intent: 'UNKNOWN', confirmationType: null };
   }
 
   private async assertActiveSession(
@@ -370,16 +536,16 @@ export class ChatService {
       return {
         order,
         assistantMessage:
-          'No encontre ese producto en el menu. Puedes decirlo de otra forma o pedirme los productos disponibles.',
+          'No estoy seguro de qué producto deseas. Puedo leerte hamburguesas, bebidas, extras o postres.',
       };
     }
 
     if (matches.length > 1) {
       return {
         order,
-        assistantMessage: `Encontre varias opciones: ${matches
+        assistantMessage: `Tengo varias opciones: ${matches
           .map((item) => item.name)
-          .join(', ')}. Dime cual quieres agregar.`,
+          .join(', ')}. ¿Cuál prefieres?`,
       };
     }
 
@@ -391,7 +557,7 @@ export class ChatService {
     if (!defaultVariant) {
       return {
         order,
-        assistantMessage: `Encontre ${item.name}, pero no tiene una variante default disponible para agregar.`,
+        assistantMessage: `Tengo ${item.name}, pero no está disponible para agregar ahora.`,
       };
     }
 
@@ -420,9 +586,12 @@ export class ChatService {
 
     return {
       order: updatedOrder,
-      assistantMessage: `Agregue ${requestedQuantity} ${item.name} a tu pedido. Total actual: ${this.formatMoney(
+      assistantMessage: `Listo, agregué ${this.formatAddedItemName(
+        requestedQuantity,
+        item.name,
+      )}. Tu total va en ${this.formatMoney(
         updatedOrder.total,
-      )}.`,
+      )}. ¿Deseas algo más o confirmamos?`,
     };
   }
 
@@ -435,7 +604,7 @@ export class ChatService {
     if (order.order_items.length === 0) {
       return {
         order,
-        assistantMessage: 'Tu pedido esta vacio. No hay productos para quitar.',
+        assistantMessage: 'Tu pedido está vacío. No hay nada que quitar.',
       };
     }
 
@@ -448,16 +617,16 @@ export class ChatService {
       return {
         order,
         assistantMessage:
-          'No encontre ese producto en tu pedido actual. Puedes pedirme el resumen para revisar lo que tienes.',
+          'No veo ese producto en tu pedido. Puedo repetirte el resumen.',
       };
     }
 
     if (matches.length > 1) {
       return {
         order,
-        assistantMessage: `Encontre varias opciones en tu pedido: ${matches
+        assistantMessage: `Veo varias opciones: ${matches
           .map((item) => item.item_name_snapshot)
-          .join(', ')}. Dime cual quieres quitar.`,
+          .join(', ')}. ¿Cuál quito?`,
       };
     }
 
@@ -474,9 +643,9 @@ export class ChatService {
 
     return {
       order: updatedOrder,
-      assistantMessage: `Quite ${item.item_name_snapshot} de tu pedido. Total actual: ${this.formatMoney(
-        updatedOrder.total,
-      )}.`,
+      assistantMessage: `Listo, quité ${this.lowercaseFirst(
+        item.item_name_snapshot,
+      )}. Tu total va en ${this.formatMoney(updatedOrder.total)}.`,
     };
   }
 
@@ -562,26 +731,45 @@ export class ChatService {
     });
 
     if (categories.length === 0) {
-      return 'Por ahora no tengo categorias disponibles en el menu.';
+      return 'Por ahora no tengo categorías disponibles.';
     }
 
-    return `Tenemos estas categorias: ${categories
+    return `Tenemos ${categories
       .map((category) => category.name)
-      .join(', ')}. Puedes pedirme una categoria o preguntar por productos.`;
+      .join(', ')}. ¿Qué categoría quieres escuchar?`;
   }
 
   private buildOrderSummaryMessage(order: OrderWithItems): string {
     if (order.order_items.length === 0) {
-      return 'Tu pedido actual esta vacio. Puedes decirme que quieres agregar cuando estes listo.';
+      return 'Tu pedido está vacío. Dime qué deseas agregar.';
     }
 
-    return `Tu pedido actual tiene: ${this.formatOrderItems(
+    return `Tienes ${this.formatOrderItems(
       order,
-    )}. Total: ${this.formatMoney(order.total)}. Aun no esta confirmado.`;
+    )}. Total: ${this.formatMoney(order.total)}. Aún no está confirmado.`;
+  }
+
+  private buildFinalConfirmationPrompt(order: OrderWithItems): string {
+    return `${this.buildOrderSummaryMessage(
+      order,
+    )} Si todo está correcto, di "confirmo".`;
+  }
+
+  private isFinalConfirmationPrompt(message: string | null): boolean {
+    if (!message) {
+      return false;
+    }
+
+    const normalizedMessage = this.normalize(message);
+
+    return (
+      normalizedMessage.includes('si todo esta correcto') &&
+      normalizedMessage.includes('confirmo')
+    );
   }
 
   private buildConfirmedOrderMessage(order: OrderWithItems): string {
-    return `Pedido confirmado. ${this.formatOrderItems(
+    return `Perfecto, pedido confirmado: ${this.formatOrderItems(
       order,
     )}. Total: ${this.formatMoney(order.total)}.`;
   }
@@ -591,16 +779,21 @@ export class ChatService {
       .map((item) => {
         const variant =
           item.variant_name_snapshot && item.variant_name_snapshot !== 'Default'
-            ? ` ${item.variant_name_snapshot}`
+            ? ` ${this.lowercaseFirst(item.variant_name_snapshot)}`
             : '';
         const modifiers =
           item.order_item_modifiers.length > 0
             ? ` con ${item.order_item_modifiers
-                .map((modifier) => modifier.option_name_snapshot)
+                .map((modifier) =>
+                  this.lowercaseFirst(modifier.option_name_snapshot),
+                )
                 .join(', ')}`
             : '';
 
-        return `${item.quantity} x ${item.item_name_snapshot}${variant}${modifiers}`;
+        return `${this.formatItemQuantity(
+          item.quantity,
+          item.item_name_snapshot,
+        )}${variant}${modifiers}`;
       })
       .join('; ');
   }
@@ -657,6 +850,22 @@ export class ChatService {
         message,
       },
     });
+  }
+
+  private async findLastAssistantMessage(
+    tx: TxClient,
+    sessionId: string,
+  ): Promise<string | null> {
+    const lastAssistantLog = await tx.interaction_logs.findFirst({
+      where: {
+        session_id: sessionId,
+        role: interaction_role.ASSISTANT,
+      },
+      select: { message: true },
+      orderBy: { created_at: 'desc' },
+    });
+
+    return lastAssistantLog?.message ?? null;
   }
 
   private async createOrderEvent(
@@ -840,11 +1049,154 @@ export class ChatService {
       .filter((token) => token.length > 1 && !stopwords.has(token));
   }
 
+  private isExplicitConfirmation(value: string): boolean {
+    if (value.startsWith('no ') || value.includes(' no confirmo')) {
+      return false;
+    }
+
+    return this.containsAny(value, [
+      'si confirmo',
+      'confirmo',
+      'confirmar pedido',
+      'confirmar el pedido',
+      'confirmar mi pedido',
+    ]);
+  }
+
+  private isClosureConfirmation(value: string): boolean {
+    return (
+      value === 'confirmar' ||
+      this.containsAny(value, [
+        'quiero hacer el pedido',
+        'hacer el pedido',
+        'haz el pedido',
+        'ya esta',
+        'eso nomas',
+        'eso no mas',
+        'si eso quiero',
+        'eso quiero',
+        'quiero confirmar',
+      ])
+    );
+  }
+
+  private isAffirmation(value: string): boolean {
+    return [
+      'si',
+      'ok',
+      'okay',
+      'dale',
+      'ya',
+      'listo',
+      'correcto',
+      'esta bien',
+      'de acuerdo',
+    ].includes(value);
+  }
+
+  private isNegation(value: string): boolean {
+    return (
+      [
+        'no',
+        'no gracias',
+        'mejor no',
+        'por ahora no',
+        'cancela',
+        'cancelar',
+        'olvidalo',
+      ].includes(value) || value.startsWith('no ')
+    );
+  }
+
   private containsAny(value: string, patterns: string[]): boolean {
     return patterns.some((pattern) => value.includes(pattern));
   }
 
+  private formatAddedItemName(quantity: number, itemName: string): string {
+    if (quantity === 1) {
+      return `${this.articleForItem(itemName)} ${this.lowercaseFirst(
+        itemName,
+      )}`;
+    }
+
+    return `${quantity} ${this.lowercaseFirst(itemName)}`;
+  }
+
+  private formatItemQuantity(quantity: number, itemName: string): string {
+    if (quantity === 1) {
+      return `${this.articleForItem(itemName)} ${this.lowercaseFirst(
+        itemName,
+      )}`;
+    }
+
+    return `${quantity} ${this.lowercaseFirst(itemName)}`;
+  }
+
+  private articleForItem(itemName: string): 'un' | 'una' {
+    const normalizedName = this.normalize(itemName);
+
+    if (
+      normalizedName.startsWith('hamburguesa') ||
+      normalizedName.startsWith('bebida') ||
+      normalizedName.startsWith('gaseosa') ||
+      normalizedName.startsWith('ensalada') ||
+      normalizedName.startsWith('pizza') ||
+      normalizedName.startsWith('entrada')
+    ) {
+      return 'una';
+    }
+
+    return 'un';
+  }
+
+  private lowercaseFirst(value: string): string {
+    if (!value) {
+      return value;
+    }
+
+    return `${value.charAt(0).toLocaleLowerCase('es-PE')}${value.slice(1)}`;
+  }
+
+  private elapsedMs(startedAt: number): number {
+    return Math.max(0, Math.round(performance.now() - startedAt));
+  }
+
   private formatMoney(value: Prisma.Decimal): string {
     return `S/ ${value.toFixed(2)}`;
+  }
+
+  private toOrderResponse(order: OrderWithItems): OrderResponseDto {
+    return {
+      id: order.id,
+      sessionId: order.session_id,
+      status: order.status,
+      subtotal: order.subtotal.toString(),
+      discountTotal: order.discount_total.toString(),
+      taxTotal: order.tax_total.toString(),
+      total: order.total.toString(),
+      notes: order.notes,
+      confirmedAt: order.confirmed_at,
+      createdAt: order.created_at,
+      updatedAt: order.updated_at,
+      items: order.order_items.map((item) => ({
+        id: item.id,
+        menuItemId: item.menu_item_id,
+        variantId: item.variant_id,
+        itemName: item.item_name_snapshot,
+        variantName: item.variant_name_snapshot,
+        unitPrice: item.unit_price_snapshot.toString(),
+        quantity: item.quantity,
+        specialInstructions: item.special_instructions,
+        lineTotal: item.line_total.toString(),
+        modifiers: item.order_item_modifiers.map((modifier) => ({
+          id: modifier.id,
+          modifierOptionId: modifier.modifier_option_id,
+          groupName: modifier.group_name_snapshot,
+          optionName: modifier.option_name_snapshot,
+          priceDelta: modifier.price_delta_snapshot.toString(),
+          quantity: modifier.quantity,
+        })),
+      })),
+    };
   }
 }

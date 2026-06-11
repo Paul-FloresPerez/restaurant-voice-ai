@@ -4,10 +4,16 @@ import { ConfigService } from '@nestjs/config';
 export type AiInterpretedIntent =
   | 'ADD_ITEM'
   | 'REMOVE_ITEM'
+  | 'READ_MENU'
+  | 'CATEGORY_QUERY'
   | 'MENU_CATEGORIES'
   | 'ORDER_SUMMARY'
   | 'CONFIRM_ORDER'
+  | 'AFFIRMATION'
+  | 'NEGATION'
   | 'UNKNOWN';
+
+export type AiConfirmationType = 'explicit' | 'closure' | 'ambiguous';
 
 export type AiInterpretation = {
   intent: AiInterpretedIntent;
@@ -15,6 +21,7 @@ export type AiInterpretation = {
   quantity: number | null;
   categoryName: string | null;
   notes: string | null;
+  confirmationType: AiConfirmationType | null;
   confidence: number;
 };
 
@@ -40,10 +47,20 @@ type OllamaTagsResponse = {
 const allowedIntents: ReadonlySet<string> = new Set([
   'ADD_ITEM',
   'REMOVE_ITEM',
+  'READ_MENU',
+  'CATEGORY_QUERY',
   'MENU_CATEGORIES',
   'ORDER_SUMMARY',
   'CONFIRM_ORDER',
+  'AFFIRMATION',
+  'NEGATION',
   'UNKNOWN',
+]);
+
+const allowedConfirmationTypes: ReadonlySet<string> = new Set([
+  'explicit',
+  'closure',
+  'ambiguous',
 ]);
 
 @Injectable()
@@ -167,8 +184,11 @@ export class AiService {
       'No ejecutes acciones. Solo clasifica el mensaje del usuario.',
       'Debes responder solo JSON valido, sin markdown, sin explicaciones y sin texto adicional.',
       'El JSON debe tener exactamente estos campos:',
-      '{"intent":"ADD_ITEM|REMOVE_ITEM|MENU_CATEGORIES|ORDER_SUMMARY|CONFIRM_ORDER|UNKNOWN","productName":string|null,"quantity":number|null,"categoryName":string|null,"notes":string|null,"confidence":number}',
+      '{"intent":"ADD_ITEM|REMOVE_ITEM|READ_MENU|CATEGORY_QUERY|ORDER_SUMMARY|CONFIRM_ORDER|AFFIRMATION|NEGATION|UNKNOWN","productName":string|null,"quantity":number|null,"categoryName":string|null,"confirmationType":"explicit|closure|ambiguous"|null,"confidence":number}',
       'Usa quantity solo si el usuario indica una cantidad clara; si no, usa null.',
+      'Usa confirmationType explicit solo para confirmaciones finales claras como "confirmo", "si confirmo" o "confirmar pedido".',
+      'Usa confirmationType closure para frases de cierre como "haz el pedido", "eso nomas", "ya esta" o "quiero hacer el pedido".',
+      'Usa confirmationType ambiguous para respuestas como "si", "ok" o "dale" cuando no pidan confirmar explicitamente.',
       'Usa confidence entre 0 y 1.',
       'Contexto disponible:',
       JSON.stringify(context),
@@ -192,6 +212,9 @@ export class AiService {
         quantity: this.optionalPositiveInteger(parsed.quantity),
         categoryName: this.optionalString(parsed.categoryName),
         notes: this.optionalString(parsed.notes),
+        confirmationType: this.optionalConfirmationType(
+          parsed.confirmationType,
+        ),
         confidence: this.confidence(parsed.confidence),
       };
     } catch {
@@ -211,6 +234,14 @@ export class AiService {
 
   private isAllowedIntent(value: unknown): value is AiInterpretedIntent {
     return typeof value === 'string' && allowedIntents.has(value);
+  }
+
+  private optionalConfirmationType(value: unknown): AiConfirmationType | null {
+    if (typeof value !== 'string' || !allowedConfirmationTypes.has(value)) {
+      return null;
+    }
+
+    return value as AiConfirmationType;
   }
 
   private optionalPositiveInteger(value: unknown): number | null {
