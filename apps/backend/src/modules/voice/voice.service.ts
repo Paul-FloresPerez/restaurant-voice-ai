@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { performance } from 'node:perf_hooks';
 import { ChatProcessingTelemetry, ChatService } from '../chat/chat.service';
 import { VoiceMessageDto } from './dto/voice-message.dto';
@@ -61,6 +66,14 @@ export class VoiceService {
         transcription = await this.sttService.transcribe(file);
       } finally {
         timingMetrics.sttMs = this.elapsedMs(sttStartedAt);
+      }
+
+      transcription = transcription.trim();
+
+      if (!transcription) {
+        throw new ServiceUnavailableException(
+          'No se detecto una transcripcion valida. El pedido no fue modificado.',
+        );
       }
 
       const chatTelemetry: ChatProcessingTelemetry = {};

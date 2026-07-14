@@ -426,25 +426,8 @@ export class ChatService {
     return spelledQuantity ?? 1;
   }
 
-  private itemLookupMessages(
-    message: string,
-    aiInterpretation: AiInterpretation | null,
-    intent: 'ADD_ITEM' | 'CANCEL_ITEM',
-  ): string[] {
-    const messages: string[] = [];
-
-    if (
-      aiInterpretation &&
-      this.normalizeAiIntent(aiInterpretation.intent) === intent &&
-      aiInterpretation.confidence >= minimumAiConfidence &&
-      aiInterpretation.productName
-    ) {
-      messages.push(aiInterpretation.productName);
-    }
-
-    messages.push(message);
-
-    return Array.from(new Set(messages));
+  private itemLookupMessages(message: string): string[] {
+    return [message];
   }
 
   private detectIntentDetails(message: string): RuleIntentResult {
@@ -615,7 +598,7 @@ export class ChatService {
     const requestedQuantity = this.resolveQuantity(message, aiInterpretation);
     const matches = await this.findMatchingMenuItems(
       tx,
-      this.itemLookupMessages(message, aiInterpretation, 'ADD_ITEM'),
+      this.itemLookupMessages(message),
     );
 
     if (matches.length === 0) {
@@ -696,7 +679,7 @@ export class ChatService {
 
     const matches = this.findMatchingOrderItems(
       order,
-      this.itemLookupMessages(message, aiInterpretation, 'CANCEL_ITEM'),
+      this.itemLookupMessages(message),
     );
 
     if (matches.length === 0) {

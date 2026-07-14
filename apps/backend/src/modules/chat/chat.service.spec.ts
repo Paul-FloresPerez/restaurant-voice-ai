@@ -31,6 +31,7 @@ describe('ChatService product matching', () => {
       'veggie',
       'hamburguesa vegetal',
     ]),
+    menuItem('soda', 'Gaseosa', ['gaseosa', 'soda', 'refresco']),
   ];
 
   const findMatches = async (message: string) => {
@@ -85,6 +86,12 @@ describe('ChatService product matching', () => {
     expect(matches.map((item) => item.name)).toEqual([
       'Hamburguesa Vegetariana',
     ]);
+  });
+
+  it('does not turn a gaseosa request into a vegetarian burger', async () => {
+    const matches = await findMatches('quiero una gaseosa');
+
+    expect(matches.map((item) => item.name)).toEqual(['Gaseosa']);
   });
 
   it('matches a product when a meaningful token has a small typo', async () => {

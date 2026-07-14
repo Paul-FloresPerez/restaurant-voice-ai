@@ -1,6 +1,5 @@
 import {
   Injectable,
-  InternalServerErrorException,
   Logger,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -13,7 +12,6 @@ import { extname, join, resolve } from 'path';
 import { promisify } from 'util';
 import { UploadedAudioFile } from './voice.types';
 
-const defaultSimulatedTranscription = 'quiero una hamburguesa vegetariana';
 const execFileAsync = promisify(execFile);
 
 type FasterWhisperResponse = {
@@ -42,17 +40,17 @@ export class SttService {
 
     try {
       return await this.transcribeWithFasterWhisper(audio);
-    } catch (error) {
-      this.logger.warn(
-        'STT real transcription failed; using simulated fallback',
-      );
+    } catch {
+      this.logger.warn('STT real transcription failed');
 
-      if (this.useSimulatedFallback()) {
-        return this.simulatedTranscription();
+      const simulatedTranscription = this.simulatedTranscriptionForTest();
+
+      if (simulatedTranscription) {
+        return simulatedTranscription;
       }
 
-      throw new InternalServerErrorException(
-        'No se pudo transcribir el audio con STT local',
+      throw new ServiceUnavailableException(
+        'No se pudo transcribir el audio con STT local. El pedido no fue modificado.',
       );
     }
   }
@@ -161,20 +159,24 @@ export class SttService {
     );
   }
 
-  private useSimulatedFallback(): boolean {
+  private simulatedTranscriptionForTest(): string | null {
+    if (process.env.NODE_ENV !== 'test') {
+      return null;
+    }
+
     const value = this.configService
       .get<string>('STT_SIMULATED_FALLBACK')
       ?.trim()
       .toLowerCase();
 
-    return value !== 'false';
-  }
+    if (value !== 'true') {
+      return null;
+    }
 
-  private simulatedTranscription(): string {
     const configuredTranscription = this.configService
       .get<string>('STT_SIMULATED_TRANSCRIPTION')
       ?.trim();
 
-    return configuredTranscription || defaultSimulatedTranscription;
+    return configuredTranscription || null;
   }
 }

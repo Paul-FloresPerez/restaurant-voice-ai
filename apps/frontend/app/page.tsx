@@ -1,6 +1,11 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createBrowserChatRequest,
+  getBackendAudioEndpoint,
+  resolveVoiceMode,
+} from "./voice-mode";
 
 type Session = {
   id: string;
@@ -121,7 +126,6 @@ type SpeakOptions = {
   markAsSpeaking?: boolean;
   onEnd?: () => void;
 };
-type AudioStopReason = "manual" | "silence" | "max-duration";
 
 declare global {
   interface Window {
@@ -134,6 +138,7 @@ declare global {
 const apiUrl = (
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001"
 ).replace(/\/$/, "");
+const voiceMode = resolveVoiceMode(process.env.NEXT_PUBLIC_VOICE_MODE);
 
 const luffyIntro =
   "Bienvenido al Restaurante Real. Soy Luffy, tu mesero virtual. Puedo leerte la carta, ayudarte a elegir productos y registrar tu pedido. Puedes decir: leer carta, hamburguesas, bebidas, postres, repetir pedido o confirmar pedido.";
@@ -154,7 +159,7 @@ const notUnderstoodMessage =
 const unsupportedRecognitionMessage =
   "Este navegador no permite reconocimiento de voz aqui. Usa Chrome o Edge, activa permisos, o usa el modo prueba.";
 const unsupportedMediaRecorderMessage =
-  "Este navegador no permite grabar audio. Usare el modo anterior si esta disponible.";
+  "Este navegador no permite grabar audio para el modo backend-audio. Usa modo browser o el modo prueba.";
 const audioSendErrorMessage =
   "No pude enviar el audio al servidor. Usa los botones rapidos o el modo prueba.";
 const noSessionForAudioMessage =
@@ -362,7 +367,7 @@ export default function Home() {
   const [selectedVoiceLabel, setSelectedVoiceLabel] =
     useState("Voz no seleccionada");
   const [recognitionLang, setRecognitionLang] =
-    useState<RecognitionLanguage>("es-ES");
+    useState<RecognitionLanguage>("es-PE");
   const [lastRecognitionError, setLastRecognitionError] =
     useState("Sin errores");
   const [isMicTemporarilyUnavailable, setIsMicTemporarilyUnavailable] =
@@ -778,7 +783,11 @@ export default function Home() {
     }
   }
 
-  async function sendChatMessage(text: string, targetSession = session) {
+  async function sendChatMessage(
+    text: string,
+    targetSession = session,
+    path: "/chat/message" = "/chat/message",
+  ) {
     const cleanMessage = text.trim();
 
     if (!cleanMessage) {
@@ -802,7 +811,7 @@ export default function Home() {
     setConversation((entries) => [...entries, newEntry("user", cleanMessage)]);
 
     try {
-      const response = await apiRequest<ChatResponse>("/chat/message", {
+      const response = await apiRequest<ChatResponse>(path, {
         method: "POST",
         body: JSON.stringify({
           sessionId: activeSession.id,
@@ -916,7 +925,7 @@ export default function Home() {
     maxRecordingTimeoutRef.current = window.setTimeout(() => {
       if (mediaRecorderRef.current?.state === "recording") {
         console.log("Grabacion detenida por limite maximo.");
-        stopAudioRecording("max-duration");
+        stopAudioRecording();
       }
     }, maxRecordingDurationMs);
   }
@@ -984,7 +993,7 @@ export default function Home() {
             silenceDetectionDelayMs
           ) {
             console.log("Silencio detectado. Deteniendo grabacion.");
-            stopAudioRecording("silence");
+            stopAudioRecording();
             return;
           }
         } else {
@@ -1053,8 +1062,15 @@ export default function Home() {
     }
 
     if (!canUseMediaRecorder()) {
+      setVoiceState("error");
       setError(unsupportedMediaRecorderMessage);
-      startRecognition(activeSession);
+      setConversation((entries) => [
+        ...entries,
+        newEntry("assistant", unsupportedMediaRecorderMessage),
+      ]);
+      void speak(unsupportedMediaRecorderMessage, {
+        onEnd: () => setVoiceState("idle"),
+      });
       return;
     }
 
@@ -1103,7 +1119,7 @@ export default function Home() {
       recorder.start();
       startAudioLevelMonitoring(stream);
       setIsRecordingAudio(true);
-      setHeardText("Grabando audio...");
+      setHeardText("");
       setError(null);
       setVoiceState("recording");
     } catch (recordingError) {
@@ -1126,7 +1142,7 @@ export default function Home() {
     }
   }
 
-  function stopAudioRecording(reason: AudioStopReason = "manual") {
+  function stopAudioRecording() {
     const recorder = mediaRecorderRef.current;
 
     if (isStoppingAudioRef.current) {
@@ -1143,13 +1159,7 @@ export default function Home() {
     stopAudioAnalysis();
     setIsRecordingAudio(false);
     setVoiceState("processing");
-    setHeardText(
-      reason === "silence"
-        ? "Silencio detectado. Enviando audio..."
-        : reason === "max-duration"
-          ? "Limite de grabacion alcanzado. Enviando audio..."
-          : "Enviando audio...",
-    );
+    setHeardText("");
     try {
       recorder.stop();
     } catch {
@@ -1188,12 +1198,22 @@ export default function Home() {
       return;
     }
 
+    const voiceEndpoint = getBackendAudioEndpoint(voiceMode);
+
+    if (!voiceEndpoint) {
+      setVoiceState("error");
+      setError(
+        "El envio de audio al backend esta deshabilitado en modo browser.",
+      );
+      return;
+    }
+
     const formData = new FormData();
     formData.append("sessionId", sessionId);
     formData.append("audio", audioBlob, "audio.webm");
 
     try {
-      const response = await fetch(`${apiUrl}/voice/message`, {
+      const response = await fetch(`${apiUrl}${voiceEndpoint}`, {
         method: "POST",
         body: formData,
       });
@@ -1217,7 +1237,7 @@ export default function Home() {
       }
 
       setError(null);
-      setHeardText(transcription || "No se detecto texto en el audio.");
+      setHeardText(transcription);
       setConversation((entries) => [
         ...entries,
         ...(transcription ? [newEntry("user", transcription)] : []),
@@ -1343,7 +1363,6 @@ export default function Home() {
     recognition.onstart = () => {
       isListeningRef.current = true;
       setVoiceState("listening");
-      console.log("SpeechRecognition iniciado. lang:", recognition.lang);
     };
 
     recognition.onresult = (event) => {
@@ -1368,14 +1387,28 @@ export default function Home() {
       }
 
       if (finalText.trim()) {
-        const normalizedTranscript = finalText.toLowerCase().trim();
-        console.log("Texto reconocido:", normalizedTranscript);
+        const browserRequest = createBrowserChatRequest(
+          activeSession.id,
+          finalText,
+        );
+
+        if (!browserRequest) {
+          return;
+        }
+
+        const recognizedText = browserRequest.body.message;
+        console.log(recognizedText);
         networkErrorCountRef.current = 0;
-        finalTranscriptRef.current = normalizedTranscript;
+        finalTranscriptRef.current = recognizedText;
+        setHeardText(recognizedText);
         ignoreNextEndRef.current = true;
         isListeningRef.current = false;
         recognition.stop();
-        void sendChatMessage(normalizedTranscript, activeSession);
+        void sendChatMessage(
+          recognizedText,
+          activeSession,
+          browserRequest.path,
+        );
       }
     };
 
@@ -1475,13 +1508,11 @@ export default function Home() {
       return;
     }
 
-    if (canUseMediaRecorder()) {
+    if (voiceMode === "backend-audio") {
       await startAudioRecording(activeSession);
       return;
     }
 
-    setMediaRecorderSupported(false);
-    setError(unsupportedMediaRecorderMessage);
     startRecognition(activeSession);
   }
 
@@ -1596,7 +1627,7 @@ export default function Home() {
 
               {heardText ? (
                 <p className="relative mt-6 max-w-3xl rounded-md border border-emerald-300/40 bg-neutral-950/90 px-5 py-4 text-2xl text-emerald-100">
-                  Escuche: {heardText}
+                  Entendí: {heardText}
                 </p>
               ) : null}
 
@@ -1671,6 +1702,9 @@ export default function Home() {
                   Ultimo error SpeechRecognition: {lastRecognitionError}
                 </p>
                 <p className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
+                  Modo de voz: {voiceMode}
+                </p>
+                <p className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
                   Grabacion real:{" "}
                   {mediaRecorderSupported ? "disponible" : "no disponible"}
                 </p>
@@ -1703,7 +1737,7 @@ export default function Home() {
             </div>
           ) : null}
 
-          {clientReady && !speechSupported ? (
+          {clientReady && voiceMode === "browser" && !speechSupported ? (
             <p className="mt-4 rounded-md border border-yellow-300/50 bg-yellow-950 px-4 py-3 text-lg text-yellow-100">
               SpeechRecognition no esta disponible en este navegador. Usa
               Chrome o Edge, o abre Modo prueba.
