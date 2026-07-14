@@ -1,10 +1,12 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { splitSpeechText } from "./speech-utils";
 import {
   createBrowserChatRequest,
   getBackendAudioEndpoint,
   resolveVoiceMode,
+  shouldUseBrowserRecognition,
 } from "./voice-mode";
 
 type Session = {
@@ -84,6 +86,7 @@ type VoiceState =
   | "processing"
   | "speaking"
   | "error";
+type BackendStatus = "preparing" | "ready" | "unavailable";
 type RecognitionLanguage = "es-ES" | "es-MX" | "es-PE";
 
 type SpeechRecognitionAlternativeLike = {
@@ -141,7 +144,7 @@ const apiUrl = (
 const voiceMode = resolveVoiceMode(process.env.NEXT_PUBLIC_VOICE_MODE);
 
 const luffyIntro =
-  "Bienvenido al Restaurante Real. Soy Luffy, tu mesero virtual. Puedo leerte la carta, ayudarte a elegir productos y registrar tu pedido. Puedes decir: leer carta, hamburguesas, bebidas, postres, repetir pedido o confirmar pedido.";
+  "Hola, soy Luffy, tu mesero virtual. Puedo leerte la carta, agregar o quitar productos y ayudarte a confirmar tu pedido. ¿Qué deseas ordenar?";
 
 const micOffMessage = "Microfono apagado. Toca para hablar nuevamente.";
 const noVoiceMessage =
@@ -164,7 +167,7 @@ const audioSendErrorMessage =
   "No pude enviar el audio al servidor. Usa los botones rapidos o el modo prueba.";
 const noSessionForAudioMessage =
   "No existe una sesion activa para enviar audio. Intenta iniciar nuevamente.";
-const silenceDetectionDelayMs = 1700;
+const silenceDetectionDelayMs = 1500;
 const recordingWarmupMs = 700;
 const maxRecordingDurationMs = 8000;
 const silenceVolumeThreshold = 0.018;
@@ -189,20 +192,20 @@ const voiceStatus: Record<VoiceState, { title: string; helper: string }> = {
     helper: "Luffy iniciara la sesion y te guiara paso a paso.",
   },
   recording: {
-    title: "Grabando audio...",
+    title: "Escuchando...",
     helper: "Toca nuevamente el centro para detener y enviar el audio.",
   },
   listening: {
-    title: "Escuchando",
+    title: "Escuchando...",
     helper:
       "Habla ahora. Puedes decir: leer carta, hamburguesas, bebidas o repetir pedido.",
   },
   processing: {
-    title: "Procesando",
+    title: "Procesando tu solicitud...",
     helper: "Luffy esta preparando o enviando tu solicitud.",
   },
   speaking: {
-    title: "Luffy esta hablando",
+    title: "Luffy está respondiendo...",
     helper: "Escucha la respuesta. Luego toca otra vez para hablar.",
   },
   error: {
@@ -276,74 +279,26 @@ function getRecognitionConstructor() {
 }
 
 function pickSpanishVoice(voices: SpeechSynthesisVoice[]) {
-  const spanishVoices = voices.filter((voice) => {
-    const haystack = `${voice.lang} ${voice.name}`.toLowerCase();
-    return (
-      voice.lang.toLowerCase().startsWith("es") ||
-      haystack.includes("spanish") ||
-      haystack.includes("espanol")
+  const languagePriority = ["es-pe", "es-mx", "es-us", "es-es"];
+  const spanishVoices = voices.filter((voice) =>
+    voice.lang.toLowerCase().startsWith("es"),
+  );
+  const bestAvailableVoice = (candidates: SpeechSynthesisVoice[]) =>
+    candidates.find((voice) => voice.localService) ?? candidates[0];
+
+  for (const language of languagePriority) {
+    const voice = bestAvailableVoice(
+      spanishVoices.filter(
+        (candidate) => candidate.lang.toLowerCase() === language,
+      ),
     );
-  });
-
-  const masculineTerms = [
-    "pablo",
-    "jorge",
-    "diego",
-    "carlos",
-    "raul",
-    "alvaro",
-    "male",
-    "hombre",
-  ];
-  const languageTerms = ["es-pe", "es-es", "es-mx"];
-  const normalizedVoice = (voice: SpeechSynthesisVoice) =>
-    `${voice.lang} ${voice.name}`.toLowerCase();
-
-  for (const language of languageTerms) {
-    const voice = spanishVoices.find((candidate) => {
-      const haystack = normalizedVoice(candidate);
-      return (
-        haystack.includes(language) &&
-        masculineTerms.some((term) => haystack.includes(term))
-      );
-    });
 
     if (voice) {
       return voice;
     }
   }
 
-  const masculineVoice = spanishVoices.find((voice) =>
-    masculineTerms.some((term) => normalizedVoice(voice).includes(term)),
-  );
-
-  if (masculineVoice) {
-    return masculineVoice;
-  }
-
-  return (
-    languageTerms
-      .map((term) =>
-        spanishVoices.find((voice) => normalizedVoice(voice).includes(term)),
-      )
-      .find(Boolean) ??
-    spanishVoices[0] ??
-    voices[0]
-  );
-}
-
-function buildCategoryMessage(items: MenuItem[]) {
-  const categories = Array.from(
-    new Set(items.map((item) => item.categoryName).filter(Boolean)),
-  );
-
-  if (categories.length === 0) {
-    return "Aun no tengo categorias disponibles. Puedes decir: leer carta, hamburguesas, bebidas o postres.";
-  }
-
-  return `Tambien puedo leer opciones de la carta. Categorias disponibles: ${categories.join(
-    ", ",
-  )}. Puedes decir: leer carta, hamburguesas, bebidas, postres, repetir pedido o confirmar pedido.`;
+  return bestAvailableVoice(spanishVoices) ?? voices[0];
 }
 
 export default function Home() {
@@ -361,6 +316,8 @@ export default function Home() {
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isTestModeOpen, setIsTestModeOpen] = useState(false);
   const [clientReady, setClientReady] = useState(false);
+  const [backendStatus, setBackendStatus] =
+    useState<BackendStatus>("preparing");
   const [speechSupported, setSpeechSupported] = useState(false);
   const [mediaRecorderSupported, setMediaRecorderSupported] = useState(false);
   const [isRecordingAudio, setIsRecordingAudio] = useState(false);
@@ -384,10 +341,6 @@ export default function Home() {
   const speechOutputUnlockedRef = useRef(false);
   const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const activeSpeechTextRef = useRef<string | null>(null);
-  const pendingSpeechRef = useRef<{
-    text: string;
-    options: SpeakOptions;
-  } | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -399,6 +352,7 @@ export default function Home() {
   const silenceStartedAtRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
   const isStoppingAudioRef = useRef(false);
+  const activeVoiceRequestRef = useRef<string | null>(null);
   const speechRunIdRef = useRef(0);
   const speechTimeoutRef = useRef<number | null>(null);
   const networkErrorCountRef = useRef(0);
@@ -416,19 +370,37 @@ export default function Home() {
   const isMicDisabled =
     !isRecordingAudio &&
     (!clientReady ||
+      backendStatus !== "ready" ||
       isCreatingSession ||
       isSendingMessage ||
       isMicTemporarilyUnavailable ||
       voiceState === "listening" ||
       voiceState === "processing" ||
       voiceState === "speaking");
-  const isChatDisabled = isCreatingSession || isSendingMessage || isRecordingAudio;
-  const currentVoiceStatus = isMicTemporarilyUnavailable
-    ? {
-        title: temporaryVoiceUnavailableMessage,
-        helper: "Usa los botones rapidos o el modo prueba. Se reactivara en unos segundos.",
-      }
-    : voiceStatus[voiceState];
+  const isChatDisabled =
+    backendStatus !== "ready" ||
+    isCreatingSession ||
+    isSendingMessage ||
+    isRecordingAudio;
+  const currentVoiceStatus =
+    backendStatus === "preparing"
+      ? {
+          title: "Preparando a Luffy...",
+          helper:
+            "El servidor se está activando. El micrófono estará disponible en un momento.",
+        }
+      : backendStatus === "unavailable"
+        ? {
+            title: "Luffy no está disponible",
+            helper: "Recarga la página para intentar conectar nuevamente.",
+          }
+        : isMicTemporarilyUnavailable
+          ? {
+              title: temporaryVoiceUnavailableMessage,
+              helper:
+                "Usa los botones rapidos o el modo prueba. Se reactivara en unos segundos.",
+            }
+          : voiceStatus[voiceState];
 
   async function loadVoices() {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
@@ -497,15 +469,41 @@ export default function Home() {
     });
   }
 
-  async function speak(text: string, options: SpeakOptions = {}) {
+  function cancelSpeechOutput() {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return;
+    }
+
+    speechRunIdRef.current += 1;
+
+    if (speechTimeoutRef.current !== null) {
+      window.clearTimeout(speechTimeoutRef.current);
+      speechTimeoutRef.current = null;
+    }
+
+    isSpeakingRef.current = false;
+    activeSpeechTextRef.current = null;
+    window.speechSynthesis.cancel();
+  }
+
+  async function speak(text: string, options: SpeakOptions = {}) {
+    const cleanText = text.trim();
+
+    if (
+      !cleanText ||
+      typeof window === "undefined" ||
+      !("speechSynthesis" in window)
+    ) {
       options.onEnd?.();
       return;
     }
 
     if (isListeningRef.current || mediaRecorderRef.current?.state === "recording") {
-      console.log("Voz de Luffy bloqueada: el microfono esta activo.");
       options.onEnd?.();
+      return;
+    }
+
+    if (isSpeakingRef.current && activeSpeechTextRef.current === cleanText) {
       return;
     }
 
@@ -514,59 +512,32 @@ export default function Home() {
     }
 
     unlockSpeechOutput();
-
-    if (isSpeakingRef.current && activeSpeechTextRef.current === text) {
-      console.log("Voz de Luffy: locucion duplicada ignorada.");
-      return;
-    }
-
-    if (
-      isSpeakingRef.current ||
-      window.speechSynthesis.speaking ||
-      window.speechSynthesis.pending
-    ) {
-      console.log("Voz de Luffy: locucion en cola hasta terminar la actual.");
-      pendingSpeechRef.current = { text, options };
-      return;
-    }
-
-    if (speechTimeoutRef.current !== null) {
-      window.clearTimeout(speechTimeoutRef.current);
-      speechTimeoutRef.current = null;
-    }
+    cancelSpeechOutput();
 
     const runId = speechRunIdRef.current + 1;
     const shouldMarkAsSpeaking = options.markAsSpeaking ?? true;
+    const chunks = splitSpeechText(cleanText);
     speechRunIdRef.current = runId;
     isSpeakingRef.current = true;
-    activeSpeechTextRef.current = text;
+    activeSpeechTextRef.current = cleanText;
 
     if (shouldMarkAsSpeaking) {
       setVoiceState("speaking");
     }
 
     const stableVoice = selectedVoiceRef.current ?? (await loadVoices());
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "es-PE";
-    utterance.rate = 0.95;
-    utterance.pitch = 0.85;
-    utterance.volume = 1;
 
-    if (stableVoice) {
-      utterance.voice = stableVoice;
+    if (speechRunIdRef.current !== runId) {
+      return;
     }
 
     let hasFinished = false;
     const finish = () => {
-      if (hasFinished) {
+      if (hasFinished || speechRunIdRef.current !== runId) {
         return;
       }
 
       hasFinished = true;
-
-      if (speechRunIdRef.current !== runId) {
-        return;
-      }
 
       if (speechTimeoutRef.current !== null) {
         window.clearTimeout(speechTimeoutRef.current);
@@ -576,43 +547,53 @@ export default function Home() {
       isSpeakingRef.current = false;
       activeSpeechTextRef.current = null;
       options.onEnd?.();
-
-      const pendingSpeech = pendingSpeechRef.current;
-      pendingSpeechRef.current = null;
-
-      if (pendingSpeech) {
-        void speak(pendingSpeech.text, pendingSpeech.options);
-      }
     };
 
-    utterance.onstart = () => {
+    const speakChunk = (index: number) => {
       if (speechRunIdRef.current !== runId) {
         return;
       }
 
-      isSpeakingRef.current = true;
-
-      if (shouldMarkAsSpeaking) {
-        setVoiceState("speaking");
+      if (index >= chunks.length) {
+        finish();
+        return;
       }
-    };
-    utterance.onend = finish;
-    utterance.onerror = (event) => {
-      console.log("speechSynthesis error:", event.error);
-      finish();
-    };
-    speechTimeoutRef.current = window.setTimeout(
-      () => {
-        if (speechRunIdRef.current !== runId) {
-          return;
+
+      const chunk = chunks[index];
+      const utterance = new SpeechSynthesisUtterance(chunk);
+      utterance.lang = "es-PE";
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      utterance.volume = 1;
+
+      if (stableVoice) {
+        utterance.voice = stableVoice;
+      }
+
+      utterance.onstart = () => {
+        if (shouldMarkAsSpeaking && speechRunIdRef.current === runId) {
+          setVoiceState("speaking");
+        }
+      };
+      utterance.onend = () => {
+        if (speechTimeoutRef.current !== null) {
+          window.clearTimeout(speechTimeoutRef.current);
+          speechTimeoutRef.current = null;
         }
 
-        console.log("speechSynthesis timeout de seguridad.");
-        finish();
-      },
-      Math.min(30000, Math.max(7000, text.length * 95)),
-    );
-    window.speechSynthesis.speak(utterance);
+        speakChunk(index + 1);
+      };
+      utterance.onerror = finish;
+      speechTimeoutRef.current = window.setTimeout(() => {
+        if (speechRunIdRef.current === runId) {
+          window.speechSynthesis.cancel();
+          finish();
+        }
+      }, Math.min(16000, Math.max(5000, chunk.length * 80)));
+      window.speechSynthesis.speak(utterance);
+    };
+
+    speakChunk(0);
   }
 
   function stopRecognition(reason: string) {
@@ -659,31 +640,72 @@ export default function Home() {
     return loadMenu();
   }
 
-  async function playWelcome(items: MenuItem[]) {
+  async function playWelcome() {
     if (hasPlayedInitialMenuRef.current) {
       return;
     }
 
     hasPlayedInitialMenuRef.current = true;
-    const categoryMessage = buildCategoryMessage(items);
-
     setConversation((entries) => [
       ...entries,
       newEntry("assistant", luffyIntro),
-      newEntry("assistant", categoryMessage),
     ]);
-    await speak(`${luffyIntro} ${categoryMessage}`, {
+    await speak(luffyIntro, {
       onEnd: () => setVoiceState("idle"),
     });
+  }
+
+  async function prepareBackend(): Promise<boolean> {
+    setBackendStatus("preparing");
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const abortController = new AbortController();
+      const timeout = window.setTimeout(() => abortController.abort(), 25000);
+
+      try {
+        const response = await fetch(`${apiUrl}/`, {
+          method: "GET",
+          cache: "no-store",
+          signal: abortController.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Backend unavailable: ${response.status}`);
+        }
+
+        setBackendStatus("ready");
+        setError(null);
+        return true;
+      } catch {
+        if (attempt < 3) {
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        }
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    }
+
+    setBackendStatus("unavailable");
+    setError(
+      "No pude preparar a Luffy. Recarga la página para intentar nuevamente.",
+    );
+    return false;
   }
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
       setClientReady(true);
-      setSpeechSupported(Boolean(getRecognitionConstructor()));
+      setSpeechSupported(
+        shouldUseBrowserRecognition(voiceMode) &&
+          Boolean(getRecognitionConstructor()),
+      );
       setMediaRecorderSupported(canUseMediaRecorder());
       void loadVoices();
-      void loadMenu();
+      void prepareBackend().then((isReady) => {
+        if (isReady) {
+          void loadMenu();
+        }
+      });
     });
 
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
@@ -694,20 +716,16 @@ export default function Home() {
 
     return () => {
       window.cancelAnimationFrame(frameId);
-      stopRecognition("component cleanup");
-      cleanupAudioCapture(false);
-      if (speechTimeoutRef.current !== null) {
-        window.clearTimeout(speechTimeoutRef.current);
-        speechTimeoutRef.current = null;
+      if (shouldUseBrowserRecognition(voiceMode)) {
+        stopRecognition("component cleanup");
       }
+      cleanupAudioCapture(false);
+      cancelSpeechOutput();
       if (micReenableTimeoutRef.current !== null) {
         window.clearTimeout(micReenableTimeoutRef.current);
         micReenableTimeoutRef.current = null;
       }
-      isSpeakingRef.current = false;
-      activeSpeechTextRef.current = null;
-      pendingSpeechRef.current = null;
-      window.speechSynthesis?.cancel();
+      activeVoiceRequestRef.current = null;
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.onvoiceschanged = null;
       }
@@ -724,13 +742,14 @@ export default function Home() {
       return null;
     }
 
+    cancelSpeechOutput();
     isCreatingSessionRef.current = true;
     setIsCreatingSession(true);
     setVoiceState("processing");
     setError(null);
 
     try {
-      const [createdSession, loadedItems] = await Promise.all([
+      const [createdSession] = await Promise.all([
         apiRequest<Session>("/sessions", {
           method: "POST",
           body: JSON.stringify({ channel: "frontend-luffy-accessible-voice" }),
@@ -744,7 +763,7 @@ export default function Home() {
 
       if (shouldPlayWelcome) {
         hasPlayedInitialMenuRef.current = false;
-        await playWelcome(loadedItems);
+        await playWelcome();
       } else {
         setVoiceState("idle");
       }
@@ -1079,8 +1098,6 @@ export default function Home() {
       return;
     }
 
-    stopRecognition("starting MediaRecorder");
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = getAudioMimeType();
@@ -1112,7 +1129,13 @@ export default function Home() {
         void speak(message, { onEnd: () => setVoiceState("idle") });
       };
 
+      let hasHandledStop = false;
       recorder.onstop = () => {
+        if (hasHandledStop) {
+          return;
+        }
+
+        hasHandledStop = true;
         void finishAudioRecording(activeSession.id, recorder.mimeType || mimeType);
       };
 
@@ -1170,6 +1193,10 @@ export default function Home() {
   }
 
   async function finishAudioRecording(sessionId: string, mimeType: string) {
+    if (activeVoiceRequestRef.current) {
+      return;
+    }
+
     const audioBlob = new Blob(audioChunksRef.current, {
       type: mimeType || "audio/webm",
     });
@@ -1208,6 +1235,11 @@ export default function Home() {
       return;
     }
 
+    const requestId = crypto.randomUUID();
+    activeVoiceRequestRef.current = requestId;
+    isSendingMessageRef.current = true;
+    setIsSendingMessage(true);
+
     const formData = new FormData();
     formData.append("sessionId", sessionId);
     formData.append("audio", audioBlob, "audio.webm");
@@ -1229,6 +1261,10 @@ export default function Home() {
         voiceResponse.assistantMessage?.trim() ||
         "No recibi una respuesta del asistente.";
 
+      if (!transcription) {
+        throw new Error("No pude entender el audio. Intenta nuevamente.");
+      }
+
       if ("order" in voiceResponse) {
         setOrder(voiceResponse.order ?? null);
         setOrderStatus(voiceResponse.order ? "" : "Sin pedido activo.");
@@ -1240,7 +1276,13 @@ export default function Home() {
       setHeardText(transcription);
       setConversation((entries) => [
         ...entries,
-        ...(transcription ? [newEntry("user", transcription)] : []),
+        newEntry("user", transcription),
+      ]);
+      await new Promise<void>((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+      });
+      setConversation((entries) => [
+        ...entries,
         newEntry("assistant", assistantMessage),
       ]);
       void speak(assistantMessage, {
@@ -1258,6 +1300,12 @@ export default function Home() {
         newEntry("assistant", message),
       ]);
       void speak(message, { onEnd: () => setVoiceState("idle") });
+    } finally {
+      if (activeVoiceRequestRef.current === requestId) {
+        activeVoiceRequestRef.current = null;
+      }
+      isSendingMessageRef.current = false;
+      setIsSendingMessage(false);
     }
   }
 
@@ -1508,12 +1556,12 @@ export default function Home() {
       return;
     }
 
-    if (voiceMode === "backend-audio") {
-      await startAudioRecording(activeSession);
+    if (shouldUseBrowserRecognition(voiceMode)) {
+      startRecognition(activeSession);
       return;
     }
 
-    startRecognition(activeSession);
+    await startAudioRecording(activeSession);
   }
 
   return (
@@ -1546,13 +1594,31 @@ export default function Home() {
                 void loadVoices();
                 void createSession();
               }}
-              disabled={isCreatingSession}
+              disabled={backendStatus !== "ready" || isCreatingSession}
               className="min-h-12 rounded-md bg-emerald-300 px-4 text-lg font-semibold text-neutral-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-300"
             >
               {session ? "Nueva sesion" : "Iniciar"}
             </button>
           </div>
         </header>
+
+        <div
+          role="status"
+          aria-live="polite"
+          className={`rounded-md border px-5 py-3 text-lg ${
+            backendStatus === "ready"
+              ? "border-emerald-300/50 bg-emerald-950 text-emerald-100"
+              : backendStatus === "preparing"
+                ? "border-amber-300/50 bg-amber-950 text-amber-100"
+                : "border-red-300/50 bg-red-950 text-red-100"
+          }`}
+        >
+          {backendStatus === "ready"
+            ? "Luffy está listo"
+            : backendStatus === "preparing"
+              ? "Preparando a Luffy..."
+              : "Luffy no está disponible"}
+        </div>
 
         {error ? (
           <div
@@ -1646,7 +1712,7 @@ export default function Home() {
 
           <aside className="grid gap-4">
             <SecondaryActions
-              disabled={isCreatingSession || isSendingMessage || isRecordingAudio}
+              disabled={isChatDisabled}
               onAction={(text) => void runQuickAction(text)}
             />
             <OrderPanel order={order} orderStatus={orderStatus} />

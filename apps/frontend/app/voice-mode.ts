@@ -9,9 +9,13 @@ export type BrowserChatRequest = {
 };
 
 export function resolveVoiceMode(configuredMode?: string): VoiceMode {
-  return configuredMode?.trim().toLowerCase() === "backend-audio"
-    ? "backend-audio"
-    : "browser";
+  return configuredMode?.trim().toLowerCase() === "browser"
+    ? "browser"
+    : "backend-audio";
+}
+
+export function shouldUseBrowserRecognition(mode: VoiceMode): boolean {
+  return mode === "browser";
 }
 
 export function createBrowserChatRequest(

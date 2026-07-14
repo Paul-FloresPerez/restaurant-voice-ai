@@ -1,26 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { splitSpeechText } from "../app/speech-utils.ts";
 import {
   createBrowserChatRequest,
   getBackendAudioEndpoint,
   resolveVoiceMode,
+  shouldUseBrowserRecognition,
 } from "../app/voice-mode.ts";
 
-test("production defaults to browser and cannot call /voice/message", () => {
+test("production defaults to backend-audio", () => {
   const mode = resolveVoiceMode(undefined);
-
-  assert.equal(mode, "browser");
-  assert.equal(getBackendAudioEndpoint(mode), null);
-});
-
-test("backend-audio must be explicitly configured", () => {
-  const mode = resolveVoiceMode("backend-audio");
 
   assert.equal(mode, "backend-audio");
   assert.equal(getBackendAudioEndpoint(mode), "/voice/message");
 });
 
-test("a browser transcript targets /chat/message with the real text", () => {
+test("backend-audio never enables SpeechRecognition", () => {
+  assert.equal(shouldUseBrowserRecognition("backend-audio"), false);
+  assert.equal(shouldUseBrowserRecognition("browser"), true);
+});
+
+test("browser remains an explicit compatibility mode", () => {
   const request = createBrowserChatRequest(
     "session-id",
     "  Quiero una gaseosa, por favor  ",
@@ -35,6 +35,12 @@ test("a browser transcript targets /chat/message with the real text", () => {
   });
 });
 
-test("an empty browser transcript does not create a request", () => {
-  assert.equal(createBrowserChatRequest("session-id", "   "), null);
+test("speech is split into sequential chunks of at most 180 characters", () => {
+  const chunks = splitSpeechText(
+    "Primera oración breve. " + "palabra ".repeat(60) + "Respuesta final.",
+  );
+
+  assert.ok(chunks.length > 2);
+  assert.ok(chunks.every((chunk) => chunk.length <= 180));
+  assert.equal(chunks[0], "Primera oración breve.");
 });

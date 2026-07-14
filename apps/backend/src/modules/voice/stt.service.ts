@@ -13,10 +13,17 @@ import { promisify } from 'util';
 import { UploadedAudioFile } from './voice.types';
 
 const execFileAsync = promisify(execFile);
+const groqTranscriptionUrl =
+  'https://api.groq.com/openai/v1/audio/transcriptions';
+const defaultGroqTimeoutMs = 20000;
 
 type FasterWhisperResponse = {
   text?: unknown;
   language?: unknown;
+};
+
+type GroqTranscriptionResponse = {
+  text?: unknown;
 };
 
 @Injectable()
@@ -27,6 +34,17 @@ export class SttService {
 
   async transcribe(audio: UploadedAudioFile): Promise<string> {
     const provider = this.sttProvider();
+
+    if (provider === 'groq') {
+      try {
+        return await this.transcribeWithGroq(audio);
+      } catch {
+        this.logger.warn('Groq STT transcription failed');
+        throw new ServiceUnavailableException(
+          'No pude entender el audio. Intenta nuevamente.',
+        );
+      }
+    }
 
     if (provider === 'browser') {
       throw new ServiceUnavailableException(
@@ -42,16 +60,62 @@ export class SttService {
       return await this.transcribeWithFasterWhisper(audio);
     } catch {
       this.logger.warn('STT real transcription failed');
-
-      const simulatedTranscription = this.simulatedTranscriptionForTest();
-
-      if (simulatedTranscription) {
-        return simulatedTranscription;
-      }
-
       throw new ServiceUnavailableException(
         'No se pudo transcribir el audio con STT local. El pedido no fue modificado.',
       );
+    }
+  }
+
+  private async transcribeWithGroq(
+    audio: UploadedAudioFile,
+  ): Promise<string> {
+    const apiKey = this.configService.get<string>('GROQ_API_KEY')?.trim();
+
+    if (!apiKey) {
+      throw new Error('GROQ_API_KEY is not configured');
+    }
+
+    const formData = new FormData();
+    const audioBytes = new Uint8Array(audio.buffer);
+    const audioBlob = new Blob([audioBytes], {
+      type: this.normalizedMimeType(audio.mimetype),
+    });
+
+    formData.append('file', audioBlob, this.audioFilename(audio));
+    formData.append('model', this.groqModelName());
+    formData.append('language', 'es');
+    formData.append('response_format', 'json');
+    formData.append('temperature', '0');
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(
+      () => abortController.abort(),
+      this.groqTimeoutMs(),
+    );
+
+    try {
+      const response = await fetch(groqTranscriptionUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: formData,
+        signal: abortController.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Groq STT returned HTTP ${response.status}`);
+      }
+
+      const parsed = (await response.json()) as GroqTranscriptionResponse;
+
+      if (typeof parsed.text !== 'string' || !parsed.text.trim()) {
+        throw new Error('Groq STT returned an empty transcription');
+      }
+
+      return parsed.text.trim();
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -137,6 +201,23 @@ export class SttService {
     return extensionsByMimeType[audio.mimetype] ?? '.audio';
   }
 
+  private audioFilename(audio: UploadedAudioFile): string {
+    const extensionByMimeType: Record<string, string> = {
+      'audio/webm': '.webm',
+      'audio/wav': '.wav',
+      'audio/mpeg': '.mp3',
+      'audio/mp4': '.mp4',
+    };
+    const extension =
+      extensionByMimeType[this.normalizedMimeType(audio.mimetype)] ?? '.webm';
+
+    return `audio${extension}`;
+  }
+
+  private normalizedMimeType(mimeType: string): string {
+    return mimeType.split(';', 1)[0].trim().toLowerCase();
+  }
+
   private pythonPath(): string {
     const configuredPath =
       this.configService.get<string>('STT_PYTHON_PATH')?.trim() ||
@@ -153,30 +234,26 @@ export class SttService {
     return this.configService.get<string>('STT_MODEL')?.trim() || 'base';
   }
 
+  private groqModelName(): string {
+    return (
+      this.configService.get<string>('GROQ_STT_MODEL')?.trim() ||
+      'whisper-large-v3-turbo'
+    );
+  }
+
+  private groqTimeoutMs(): number {
+    const configuredTimeout = Number(
+      this.configService.get<string>('GROQ_STT_TIMEOUT_MS')?.trim(),
+    );
+
+    return Number.isFinite(configuredTimeout) && configuredTimeout >= 1000
+      ? Math.min(configuredTimeout, 120000)
+      : defaultGroqTimeoutMs;
+  }
+
   private sttProvider(): string {
     return (
       this.configService.get<string>('STT_PROVIDER')?.trim() || 'faster-whisper'
     );
-  }
-
-  private simulatedTranscriptionForTest(): string | null {
-    if (process.env.NODE_ENV !== 'test') {
-      return null;
-    }
-
-    const value = this.configService
-      .get<string>('STT_SIMULATED_FALLBACK')
-      ?.trim()
-      .toLowerCase();
-
-    if (value !== 'true') {
-      return null;
-    }
-
-    const configuredTranscription = this.configService
-      .get<string>('STT_SIMULATED_TRANSCRIPTION')
-      ?.trim();
-
-    return configuredTranscription || null;
   }
 }

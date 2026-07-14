@@ -5,9 +5,9 @@ import { UploadedAudioFile } from './voice.types';
 
 const audio: UploadedAudioFile = {
   originalname: 'message.webm',
-  mimetype: 'audio/webm',
-  size: 1,
-  buffer: Buffer.from('a'),
+  mimetype: 'audio/webm;codecs=opus',
+  size: 4,
+  buffer: Buffer.from('audio'),
 };
 
 const configService = (values: Record<string, string>) =>
@@ -25,21 +25,69 @@ const failLocalStt = (service: SttService) => {
     .mockRejectedValue(new Error('local STT failed'));
 };
 
-describe('SttService safe providers', () => {
-  it('returns 503 for browser provider and directs clients to chat', async () => {
+describe('SttService providers', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('sends real audio to Groq with the configured transcription fields', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ text: '  quiero una gaseosa  ' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
     const service = new SttService(
-      configService({ STT_PROVIDER: 'browser' }),
+      configService({
+        STT_PROVIDER: 'groq',
+        GROQ_API_KEY: 'test-key',
+        GROQ_STT_MODEL: 'whisper-large-v3-turbo',
+      }),
+    );
+
+    await expect(service.transcribe(audio)).resolves.toBe(
+      'quiero una gaseosa',
+    );
+
+    const [url, request] = fetchMock.mock.calls[0];
+    const body = request?.body as FormData;
+    const file = body.get('file');
+
+    expect(url).toBe(
+      'https://api.groq.com/openai/v1/audio/transcriptions',
+    );
+    expect(request?.method).toBe('POST');
+    expect(request?.headers).toEqual({ Authorization: 'Bearer test-key' });
+    expect(file).toBeInstanceOf(Blob);
+    expect((file as Blob).type).toBe('audio/webm');
+    expect(body.get('model')).toBe('whisper-large-v3-turbo');
+    expect(body.get('language')).toBe('es');
+    expect(body.get('response_format')).toBe('json');
+    expect(body.get('temperature')).toBe('0');
+  });
+
+  it('returns the controlled message when Groq fails', async () => {
+    jest.spyOn(global, 'fetch').mockResolvedValue(new Response(null, { status: 503 }));
+    const service = new SttService(
+      configService({
+        STT_PROVIDER: 'groq',
+        GROQ_API_KEY: 'test-key',
+      }),
     );
 
     await expect(service.transcribe(audio)).rejects.toMatchObject({
       status: 503,
-      message: expect.stringContaining('/chat/message'),
+      message: 'No pude entender el audio. Intenta nuevamente.',
     });
   });
 
-  it('returns a controlled error without inventing text when local STT fails', async () => {
+  it('does not use a simulated fallback when local STT fails', async () => {
     const service = new SttService(
-      configService({ STT_PROVIDER: 'faster-whisper' }),
+      configService({
+        STT_PROVIDER: 'faster-whisper',
+        STT_SIMULATED_FALLBACK: 'true',
+        STT_SIMULATED_TRANSCRIPTION: 'quiero una hamburguesa vegetariana',
+      }),
     );
     failLocalStt(service);
 
@@ -48,40 +96,13 @@ describe('SttService safe providers', () => {
     );
   });
 
-  it('allows an explicitly configured simulated transcription only in tests', async () => {
+  it('returns 503 for the legacy browser provider', async () => {
     const service = new SttService(
-      configService({
-        STT_PROVIDER: 'faster-whisper',
-        STT_SIMULATED_FALLBACK: 'true',
-        STT_SIMULATED_TRANSCRIPTION: 'transcripcion automatizada de prueba',
-      }),
+      configService({ STT_PROVIDER: 'browser' }),
     );
-    failLocalStt(service);
 
-    await expect(service.transcribe(audio)).resolves.toBe(
-      'transcripcion automatizada de prueba',
+    await expect(service.transcribe(audio)).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
     );
-  });
-
-  it('ignores simulated fallback outside NODE_ENV=test', async () => {
-    const originalNodeEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-
-    try {
-      const service = new SttService(
-        configService({
-          STT_PROVIDER: 'faster-whisper',
-          STT_SIMULATED_FALLBACK: 'true',
-          STT_SIMULATED_TRANSCRIPTION: 'transcripcion no permitida',
-        }),
-      );
-      failLocalStt(service);
-
-      await expect(service.transcribe(audio)).rejects.toBeInstanceOf(
-        ServiceUnavailableException,
-      );
-    } finally {
-      process.env.NODE_ENV = originalNodeEnv;
-    }
   });
 });

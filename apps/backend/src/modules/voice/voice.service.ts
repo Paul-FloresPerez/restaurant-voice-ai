@@ -115,11 +115,23 @@ export class VoiceService {
       throw new BadRequestException('Audio file is required');
     }
 
-    if (!allowedAudioMimeTypes.has(file.mimetype)) {
+    if (file.size <= 0 || file.buffer.length === 0) {
+      throw new BadRequestException('Audio file is empty');
+    }
+
+    const normalizedMimeType = file.mimetype
+      .split(';', 1)[0]
+      .trim()
+      .toLowerCase();
+
+    if (!allowedAudioMimeTypes.has(normalizedMimeType)) {
       throw new BadRequestException('Unsupported audio MIME type');
     }
 
-    if (file.size > maxAudioFileSizeBytes) {
+    if (
+      file.size > maxAudioFileSizeBytes ||
+      file.buffer.length > maxAudioFileSizeBytes
+    ) {
       throw new BadRequestException('Audio file is too large');
     }
   }
