@@ -2,7 +2,7 @@ import { OrderResponseDto } from '../../order/dto/order-response.dto';
 
 export type ChatIntent =
   | 'ADD_ITEM'
-  | 'REMOVE_ITEM'
+  | 'CANCEL_ITEM'
   | 'READ_MENU'
   | 'CATEGORY_QUERY'
   | 'MENU_CATEGORIES'

@@ -2,10 +2,25 @@ import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 
+function getAllowedOrigins(): string[] {
+  const configuredOrigins = [process.env.CORS_ORIGIN, process.env.FRONTEND_URL]
+    .flatMap((value) => value?.split(',') ?? [])
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  if (configuredOrigins.length > 0 || process.env.NODE_ENV === 'production') {
+    return configuredOrigins;
+  }
+
+  return ['http://localhost:3000'];
+}
+
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  const allowedOrigins = getAllowedOrigins();
+
   app.enableCors({
-    origin: 'http://localhost:3000',
+    origin: allowedOrigins.length > 0 ? allowedOrigins : false,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   });
   app.useGlobalPipes(
@@ -15,6 +30,7 @@ async function bootstrap() {
       transform: true,
     }),
   );
-  await app.listen(process.env.PORT ?? 3000);
+  const port = process.env.PORT || 3001;
+  await app.listen(port, '0.0.0.0');
 }
 bootstrap();

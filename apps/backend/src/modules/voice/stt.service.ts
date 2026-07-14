@@ -2,6 +2,7 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
@@ -27,8 +28,16 @@ export class SttService {
   constructor(private readonly configService: ConfigService) {}
 
   async transcribe(audio: UploadedAudioFile): Promise<string> {
-    if (this.sttProvider() !== 'faster-whisper') {
-      return this.simulatedTranscription();
+    const provider = this.sttProvider();
+
+    if (provider === 'browser') {
+      throw new ServiceUnavailableException(
+        'La transcripcion de audio no esta disponible en este despliegue. Envia texto a /chat/message.',
+      );
+    }
+
+    if (provider !== 'faster-whisper') {
+      throw new ServiceUnavailableException('STT provider is not supported');
     }
 
     try {

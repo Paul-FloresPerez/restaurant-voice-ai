@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 
 export type AiInterpretedIntent =
   | 'ADD_ITEM'
+  | 'CANCEL_ITEM'
   | 'REMOVE_ITEM'
   | 'READ_MENU'
   | 'CATEGORY_QUERY'
@@ -27,6 +28,7 @@ export type AiInterpretation = {
 
 export type AiHealthResponse = {
   ok: boolean;
+  enabled: boolean;
   baseUrl: string;
   model: string;
   modelAvailable: boolean;
@@ -46,6 +48,7 @@ type OllamaTagsResponse = {
 
 const allowedIntents: ReadonlySet<string> = new Set([
   'ADD_ITEM',
+  'CANCEL_ITEM',
   'REMOVE_ITEM',
   'READ_MENU',
   'CATEGORY_QUERY',
@@ -66,14 +69,27 @@ const allowedConfirmationTypes: ReadonlySet<string> = new Set([
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
+  private ollamaUnavailableUntil = 0;
 
   constructor(private readonly configService: ConfigService) {}
 
   async checkHealth(): Promise<AiHealthResponse> {
     const baseUrl = this.ollamaBaseUrl();
     const model = this.ollamaModel();
+
+    if (!baseUrl) {
+      return {
+        ok: false,
+        enabled: false,
+        baseUrl: '',
+        model,
+        modelAvailable: false,
+        error: 'OLLAMA_NOT_CONFIGURED',
+      };
+    }
+
     const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), 5000);
+    const timeout = setTimeout(() => abortController.abort(), 2000);
 
     try {
       const response = await fetch(`${baseUrl}/api/tags`, {
@@ -84,6 +100,7 @@ export class AiService {
       if (!response.ok) {
         return {
           ok: false,
+          enabled: true,
           baseUrl,
           model,
           modelAvailable: false,
@@ -97,6 +114,7 @@ export class AiService {
 
       return {
         ok: modelAvailable,
+        enabled: true,
         baseUrl,
         model,
         modelAvailable,
@@ -105,6 +123,7 @@ export class AiService {
     } catch {
       return {
         ok: false,
+        enabled: true,
         baseUrl,
         model,
         modelAvailable: false,
@@ -121,8 +140,17 @@ export class AiService {
   ): Promise<AiInterpretation | null> {
     const baseUrl = this.ollamaBaseUrl();
     const model = this.ollamaModel();
+
+    if (!baseUrl) {
+      return null;
+    }
+
+    if (Date.now() < this.ollamaUnavailableUntil) {
+      return null;
+    }
+
     const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), 5000);
+    const timeout = setTimeout(() => abortController.abort(), 2000);
 
     this.logger.log('AI interpretation requested');
 
@@ -146,6 +174,7 @@ export class AiService {
 
       if (!response.ok) {
         this.logger.warn('AI interpretation failed, using fallback');
+        this.markOllamaUnavailable();
         return null;
       }
 
@@ -153,6 +182,7 @@ export class AiService {
 
       if (typeof data.response !== 'string') {
         this.logger.warn('AI interpretation failed, using fallback');
+        this.markOllamaUnavailable();
         return null;
       }
 
@@ -160,16 +190,19 @@ export class AiService {
 
       if (!interpretation) {
         this.logger.warn('AI interpretation failed, using fallback');
+        this.markOllamaUnavailable();
         return null;
       }
 
       this.logger.log(
         `AI interpretation success intent=${interpretation.intent} confidence=${interpretation.confidence}`,
       );
+      this.ollamaUnavailableUntil = 0;
 
       return interpretation;
     } catch {
       this.logger.warn('AI interpretation failed, using fallback');
+      this.markOllamaUnavailable();
       return null;
     } finally {
       clearTimeout(timeout);
@@ -184,7 +217,7 @@ export class AiService {
       'No ejecutes acciones. Solo clasifica el mensaje del usuario.',
       'Debes responder solo JSON valido, sin markdown, sin explicaciones y sin texto adicional.',
       'El JSON debe tener exactamente estos campos:',
-      '{"intent":"ADD_ITEM|REMOVE_ITEM|READ_MENU|CATEGORY_QUERY|ORDER_SUMMARY|CONFIRM_ORDER|AFFIRMATION|NEGATION|UNKNOWN","productName":string|null,"quantity":number|null,"categoryName":string|null,"confirmationType":"explicit|closure|ambiguous"|null,"confidence":number}',
+      '{"intent":"ADD_ITEM|CANCEL_ITEM|READ_MENU|CATEGORY_QUERY|ORDER_SUMMARY|CONFIRM_ORDER|AFFIRMATION|NEGATION|UNKNOWN","productName":string|null,"quantity":number|null,"categoryName":string|null,"confirmationType":"explicit|closure|ambiguous"|null,"confidence":number}',
       'Usa quantity solo si el usuario indica una cantidad clara; si no, usa null.',
       'Usa confirmationType explicit solo para confirmaciones finales claras como "confirmo", "si confirmo" o "confirmar pedido".',
       'Usa confirmationType closure para frases de cierre como "haz el pedido", "eso nomas", "ya esta" o "quiero hacer el pedido".',
@@ -268,24 +301,27 @@ export class AiService {
       .filter((value): value is string => typeof value === 'string');
   }
 
-  private ollamaBaseUrl(): string {
+  private ollamaBaseUrl(): string | null {
     const value =
       this.configService.get<string>('OLLAMA_BASE_URL') ??
-      process.env.OLLAMA_BASE_URL ??
-      'http://localhost:11434';
+      process.env.OLLAMA_BASE_URL;
+    const cleanedValue = value ? this.cleanBaseUrl(value) : '';
 
-    return this.cleanBaseUrl(value);
+    return cleanedValue || null;
   }
 
   private ollamaModel(): string {
-    return (
-      this.configService.get<string>('OLLAMA_MODEL') ??
-      process.env.OLLAMA_MODEL ??
-      'qwen2.5:3b'
-    );
+    const configuredModel = this.configService.get<string>('OLLAMA_MODEL');
+    const environmentModel = process.env.OLLAMA_MODEL;
+
+    return configuredModel?.trim() || environmentModel?.trim() || 'qwen2.5:3b';
   }
 
   private cleanBaseUrl(value: string): string {
-    return value.replace(/\/+$/, '');
+    return value.trim().replace(/\/+$/, '');
+  }
+
+  private markOllamaUnavailable(): void {
+    this.ollamaUnavailableUntil = Date.now() + 30_000;
   }
 }

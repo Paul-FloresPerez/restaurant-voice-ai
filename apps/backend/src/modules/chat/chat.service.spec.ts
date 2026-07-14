@@ -78,4 +78,18 @@ describe('ChatService product matching', () => {
       'Hamburguesa Vegetariana',
     ]);
   });
+
+  it('maps product synonyms to their canonical menu item', async () => {
+    const matches = await findMatches('unas veggie por favor');
+
+    expect(matches.map((item) => item.name)).toEqual([
+      'Hamburguesa Vegetariana',
+    ]);
+  });
+
+  it('matches a product when a meaningful token has a small typo', async () => {
+    const matches = await findMatches('quiero una hamburguesa clazica');
+
+    expect(matches.map((item) => item.name)).toEqual(['Hamburguesa Clasica']);
+  });
 });

@@ -22,6 +22,72 @@ import { SendChatMessageDto } from './dto/send-chat-message.dto';
 
 const minimumAiConfidence = 0.6;
 
+const productSynonyms = [
+  {
+    canonicalName: 'hamburguesa vegetariana',
+    phrases: ['veggie', 'vegetal', 'sin carne'],
+  },
+  {
+    canonicalName: 'hamburguesa',
+    phrases: ['burger', 'hamburguesa'],
+  },
+  {
+    canonicalName: 'gaseosa',
+    phrases: ['soda', 'refresco', 'gaseosa'],
+  },
+  {
+    canonicalName: 'papas fritas',
+    phrases: ['papitas', 'papas', 'papas fritas'],
+  },
+  {
+    canonicalName: 'helado',
+    phrases: ['heladito', 'helado'],
+  },
+] as const;
+
+const irrelevantWords = new Set([
+  'a',
+  'agrega',
+  'al',
+  'anade',
+  'con',
+  'de',
+  'del',
+  'dame',
+  'el',
+  'elimina',
+  'favor',
+  'la',
+  'las',
+  'los',
+  'me',
+  'mi',
+  'para',
+  'pedido',
+  'please',
+  'ponme',
+  'por',
+  'quiero',
+  'quita',
+  'un',
+  'una',
+]);
+
+const spelledQuantities: Readonly<Record<string, number>> = {
+  un: 1,
+  una: 1,
+  uno: 1,
+  dos: 2,
+  tres: 3,
+  cuatro: 4,
+  cinco: 5,
+  seis: 6,
+  siete: 7,
+  ocho: 8,
+  nueve: 9,
+  diez: 10,
+};
+
 const orderInclude = {
   order_items: {
     include: {
@@ -100,7 +166,7 @@ export class ChatService {
           );
           order = result.order;
           assistantMessage = result.assistantMessage;
-        } else if (intent === 'REMOVE_ITEM') {
+        } else if (intent === 'CANCEL_ITEM') {
           const result = await this.removeRequestedItem(
             tx,
             order,
@@ -124,11 +190,12 @@ export class ChatService {
           }
         } else if (intent === 'ORDER_SUMMARY') {
           assistantMessage = this.buildOrderSummaryMessage(order);
-        } else if (
-          intent === 'READ_MENU' ||
-          intent === 'CATEGORY_QUERY' ||
-          intent === 'MENU_CATEGORIES'
-        ) {
+        } else if (intent === 'CATEGORY_QUERY') {
+          assistantMessage = await this.buildCategoryItemsMessage(
+            tx,
+            dto.message,
+          );
+        } else if (intent === 'READ_MENU' || intent === 'MENU_CATEGORIES') {
           assistantMessage = await this.buildMenuCategoriesMessage(tx);
         } else if (intent === 'AFFIRMATION') {
           assistantMessage =
@@ -228,7 +295,7 @@ export class ChatService {
       currentMessage: message,
       supportedIntents: [
         'ADD_ITEM',
-        'REMOVE_ITEM',
+        'CANCEL_ITEM',
         'READ_MENU',
         'CATEGORY_QUERY',
         'ORDER_SUMMARY',
@@ -279,7 +346,7 @@ export class ChatService {
   ): ChatIntent {
     const ruleIntent = this.detectIntentDetails(message);
 
-    if (this.isConversationalControlIntent(ruleIntent.intent)) {
+    if (ruleIntent.intent !== 'UNKNOWN') {
       return ruleIntent.intent;
     }
 
@@ -309,9 +376,7 @@ export class ChatService {
       this.normalizeAiIntent(aiInterpretation.intent) === 'CONFIRM_ORDER' &&
       aiInterpretation.confirmationType
     ) {
-      return aiInterpretation.confirmationType === 'explicit'
-        ? 'closure'
-        : aiInterpretation.confirmationType;
+      return aiInterpretation.confirmationType;
     }
 
     if (
@@ -326,19 +391,17 @@ export class ChatService {
   }
 
   private normalizeAiIntent(intent: AiInterpretation['intent']): ChatIntent {
-    return intent === 'MENU_CATEGORIES' ? 'READ_MENU' : intent;
+    if (intent === 'MENU_CATEGORIES') {
+      return 'READ_MENU';
+    }
+
+    return intent === 'REMOVE_ITEM' ? 'CANCEL_ITEM' : intent;
   }
 
-  private isConversationalControlIntent(intent: ChatIntent): boolean {
-    return [
-      'CONFIRM_ORDER',
-      'AFFIRMATION',
-      'NEGATION',
-      'ORDER_SUMMARY',
-    ].includes(intent);
-  }
-
-  private resolveQuantity(aiInterpretation: AiInterpretation | null): number {
+  private resolveQuantity(
+    message: string,
+    aiInterpretation: AiInterpretation | null,
+  ): number {
     if (
       aiInterpretation &&
       aiInterpretation.intent === 'ADD_ITEM' &&
@@ -348,19 +411,31 @@ export class ChatService {
       return aiInterpretation.quantity;
     }
 
-    return 1;
+    const normalizedMessage = this.normalize(message);
+    const numericQuantity = normalizedMessage.match(/(?:^|\s)(\d{1,2})(?:\s|$)/);
+
+    if (numericQuantity) {
+      return Number(numericQuantity[1]);
+    }
+
+    const spelledQuantity = normalizedMessage
+      .split(' ')
+      .map((token) => spelledQuantities[token])
+      .find((quantity) => quantity !== undefined);
+
+    return spelledQuantity ?? 1;
   }
 
   private itemLookupMessages(
     message: string,
     aiInterpretation: AiInterpretation | null,
-    intent: 'ADD_ITEM' | 'REMOVE_ITEM',
+    intent: 'ADD_ITEM' | 'CANCEL_ITEM',
   ): string[] {
     const messages: string[] = [];
 
     if (
       aiInterpretation &&
-      aiInterpretation.intent === intent &&
+      this.normalizeAiIntent(aiInterpretation.intent) === intent &&
       aiInterpretation.confidence >= minimumAiConfidence &&
       aiInterpretation.productName
     ) {
@@ -383,19 +458,19 @@ export class ChatService {
       return { intent: 'CONFIRM_ORDER', confirmationType: 'closure' };
     }
 
-    if (
-      this.containsAny(normalizedMessage, [
-        'repiteme mi pedido',
-        'repite mi pedido',
-        'resumen',
-        'que pedi',
-      ])
-    ) {
+    if (this.containsAny(normalizedMessage, [
+      'repiteme mi pedido',
+      'repite mi pedido',
+      'resumen',
+      'que pedi',
+      'mi pedido',
+      'mi orden',
+    ])) {
       return { intent: 'ORDER_SUMMARY', confirmationType: null };
     }
 
-    if (this.containsAny(normalizedMessage, ['quita', 'elimina'])) {
-      return { intent: 'REMOVE_ITEM', confirmationType: null };
+    if (this.isCancelItemRequest(normalizedMessage)) {
+      return { intent: 'CANCEL_ITEM', confirmationType: null };
     }
 
     if (this.isNegation(normalizedMessage)) {
@@ -409,6 +484,7 @@ export class ChatService {
         'bebidas',
         'postres',
         'combos',
+        'extras',
       ])
     ) {
       return { intent: 'CATEGORY_QUERY', confirmationType: null };
@@ -420,6 +496,10 @@ export class ChatService {
         'carta',
         'productos',
         'que hay',
+        'que tienen',
+        'que ofrecen',
+        'muestrame',
+        'lista',
       ])
     ) {
       return { intent: 'READ_MENU', confirmationType: null };
@@ -432,8 +512,14 @@ export class ChatService {
         'anade',
         'ponme',
         'dame',
+        'me das',
+        'ordenar',
       ])
     ) {
+      return { intent: 'ADD_ITEM', confirmationType: null };
+    }
+
+    if (this.hasProductSynonym(normalizedMessage)) {
       return { intent: 'ADD_ITEM', confirmationType: null };
     }
 
@@ -526,7 +612,7 @@ export class ChatService {
     message: string,
     aiInterpretation: AiInterpretation | null,
   ): Promise<{ order: OrderWithItems; assistantMessage: string }> {
-    const requestedQuantity = this.resolveQuantity(aiInterpretation);
+    const requestedQuantity = this.resolveQuantity(message, aiInterpretation);
     const matches = await this.findMatchingMenuItems(
       tx,
       this.itemLookupMessages(message, aiInterpretation, 'ADD_ITEM'),
@@ -610,7 +696,7 @@ export class ChatService {
 
     const matches = this.findMatchingOrderItems(
       order,
-      this.itemLookupMessages(message, aiInterpretation, 'REMOVE_ITEM'),
+      this.itemLookupMessages(message, aiInterpretation, 'CANCEL_ITEM'),
     );
 
     if (matches.length === 0) {
@@ -737,6 +823,46 @@ export class ChatService {
     return `Tenemos ${categories
       .map((category) => category.name)
       .join(', ')}. ¿Qué categoría quieres escuchar?`;
+  }
+
+  private async buildCategoryItemsMessage(
+    tx: TxClient,
+    message: string,
+  ): Promise<string> {
+    const categories = await tx.categories.findMany({
+      where: { is_active: true },
+      select: { id: true, name: true },
+      orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+    });
+    const matchingCategories = categories.filter((category) =>
+      this.matchesCategory(this.normalize(message), category.name),
+    );
+
+    if (matchingCategories.length !== 1) {
+      return this.buildMenuCategoriesMessage(tx);
+    }
+
+    const category = matchingCategories[0];
+    const items = await tx.menu_items.findMany({
+      where: {
+        category_id: category.id,
+        is_active: true,
+        is_available: true,
+      },
+      select: { name: true },
+      orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+      take: 8,
+    });
+
+    if (items.length === 0) {
+      return `Por ahora no tengo productos disponibles en ${this.lowercaseFirst(
+        category.name,
+      )}.`;
+    }
+
+    return `En ${this.lowercaseFirst(category.name)} tenemos ${items
+      .map((item) => item.name)
+      .join(', ')}. ¿Cuál deseas agregar?`;
   }
 
   private buildOrderSummaryMessage(order: OrderWithItems): string {
@@ -910,6 +1036,8 @@ export class ChatService {
     }
 
     const aliasScore = this.bestAliasScore(item, normalizedMessage, allItems);
+    const synonymScore = this.bestSynonymScore(item, normalizedMessage);
+    const fuzzyScore = this.bestFuzzyScore(item, messageTokens, allItems);
     const broadScore = this.matchesByUserTokens(messageTokens, [
       item.name,
       ...item.search_aliases,
@@ -917,7 +1045,53 @@ export class ChatService {
       ? 100
       : 0;
 
-    return Math.max(aliasScore, broadScore);
+    return Math.max(aliasScore, synonymScore, fuzzyScore, broadScore);
+  }
+
+  private bestSynonymScore(
+    item: MenuItemWithVariants,
+    normalizedMessage: string,
+  ): number {
+    return productSynonyms.reduce((bestScore, synonym) => {
+      const isRequested = synonym.phrases.some((phrase) =>
+        this.containsPhrase(normalizedMessage, phrase),
+      );
+
+      if (!isRequested || !this.isCanonicalItem(item, synonym.canonicalName)) {
+        return bestScore;
+      }
+
+      return Math.max(bestScore, 325);
+    }, 0);
+  }
+
+  private bestFuzzyScore(
+    item: MenuItemWithVariants,
+    messageTokens: string[],
+    allItems: MenuItemWithVariants[],
+  ): number {
+    if (messageTokens.length === 0) {
+      return 0;
+    }
+
+    return [item.name, ...item.search_aliases].reduce((bestScore, term) => {
+      const termTokens = this.toMeaningfulTokens(term);
+
+      if (
+        termTokens.length === 0 ||
+        !termTokens.every((termToken) =>
+          messageTokens.some((messageToken) =>
+            this.isFuzzyTokenMatch(messageToken, termToken),
+          ),
+        ) ||
+        (termTokens.length === 1 &&
+          !this.isSpecificSingleTokenAlias(termTokens[0], allItems))
+      ) {
+        return bestScore;
+      }
+
+      return Math.max(bestScore, 180 + termTokens.length);
+    }, 0);
   }
 
   private bestAliasScore(
@@ -1014,39 +1188,101 @@ export class ChatService {
         return true;
       }
 
-      return this.matchesByUserTokens(messageTokens, [normalizedTerm]);
+      if (this.matchesByUserTokens(messageTokens, [normalizedTerm])) {
+        return true;
+      }
+
+      if (
+        productSynonyms.some(
+          (synonym) =>
+            synonym.phrases.some((phrase) =>
+              this.containsPhrase(normalizedMessage, phrase),
+            ) &&
+            this.normalize(normalizedTerm) ===
+              this.normalize(synonym.canonicalName),
+        )
+      ) {
+        return true;
+      }
+
+      return this.toMeaningfulTokens(normalizedTerm).every((termToken) =>
+        messageTokens.some((messageToken) =>
+          this.isFuzzyTokenMatch(messageToken, termToken),
+        ),
+      );
     });
   }
 
   private toMeaningfulTokens(value: string): string[] {
-    const stopwords = new Set([
-      'agrega',
-      'al',
-      'anade',
-      'con',
-      'dame',
-      'del',
-      'el',
-      'elimina',
-      'favor',
-      'la',
-      'las',
-      'los',
-      'me',
-      'mi',
-      'para',
-      'pedido',
-      'ponme',
-      'por',
-      'quita',
-      'quiero',
-      'un',
-      'una',
-    ]);
-
     return this.normalize(value)
       .split(/\s+/)
-      .filter((token) => token.length > 1 && !stopwords.has(token));
+      .filter((token) => token.length > 1 && !irrelevantWords.has(token));
+  }
+
+  private hasProductSynonym(normalizedMessage: string): boolean {
+    return productSynonyms.some((synonym) =>
+      synonym.phrases.some((phrase) =>
+        this.containsPhrase(normalizedMessage, phrase),
+      ),
+    );
+  }
+
+  private isCanonicalItem(
+    item: MenuItemWithVariants,
+    canonicalName: string,
+  ): boolean {
+    return this.normalize(item.name) === this.normalize(canonicalName);
+  }
+
+  private matchesCategory(normalizedMessage: string, categoryName: string): boolean {
+    const normalizedCategoryName = this.normalize(categoryName);
+
+    return this.containsPhrase(normalizedMessage, normalizedCategoryName);
+  }
+
+  private isCancelItemRequest(value: string): boolean {
+    if (this.containsPhrase(value, 'cancelar pedido')) {
+      return false;
+    }
+
+    return /^(quita|quitar|elimina|eliminar|saca|sacar|borra|borrar|cancela|cancelar)\b/.test(
+      value,
+    );
+  }
+
+  private isFuzzyTokenMatch(value: string, candidate: string): boolean {
+    if (value === candidate) {
+      return true;
+    }
+
+    if (value.length < 4 || candidate.length < 4) {
+      return false;
+    }
+
+    const maximumDistance = Math.max(value.length, candidate.length) >= 7 ? 2 : 1;
+
+    return this.levenshteinDistance(value, candidate) <= maximumDistance;
+  }
+
+  private levenshteinDistance(first: string, second: string): number {
+    let previousRow = Array.from({ length: second.length + 1 }, (_, index) => index);
+
+    for (let firstIndex = 1; firstIndex <= first.length; firstIndex += 1) {
+      const currentRow = [firstIndex];
+
+      for (let secondIndex = 1; secondIndex <= second.length; secondIndex += 1) {
+        currentRow[secondIndex] = Math.min(
+          currentRow[secondIndex - 1] + 1,
+          previousRow[secondIndex] + 1,
+          previousRow[secondIndex - 1] +
+            (first[firstIndex - 1] === second[secondIndex - 1] ? 0 : 1),
+        );
+      }
+
+      previousRow = currentRow;
+    }
+
+    return previousRow[second.length];
   }
 
   private isExplicitConfirmation(value: string): boolean {
@@ -1109,7 +1345,13 @@ export class ChatService {
   }
 
   private containsAny(value: string, patterns: string[]): boolean {
-    return patterns.some((pattern) => value.includes(pattern));
+    return patterns.some((pattern) => this.containsPhrase(value, pattern));
+  }
+
+  private containsPhrase(value: string, phrase: string): boolean {
+    const normalizedPhrase = this.normalize(phrase);
+
+    return ` ${value} `.includes(` ${normalizedPhrase} `);
   }
 
   private formatAddedItemName(quantity: number, itemName: string): string {
