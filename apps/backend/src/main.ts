@@ -5,7 +5,7 @@ import { AppModule } from './app.module';
 function getAllowedOrigins(): string[] {
   const configuredOrigins = [process.env.CORS_ORIGIN, process.env.FRONTEND_URL]
     .flatMap((value) => value?.split(',') ?? [])
-    .map((origin) => origin.trim())
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean);
 
   if (configuredOrigins.length > 0 || process.env.NODE_ENV === 'production') {
@@ -22,6 +22,8 @@ async function bootstrap() {
   app.enableCors({
     origin: allowedOrigins.length > 0 ? allowedOrigins : false,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: false,
   });
   app.useGlobalPipes(
     new ValidationPipe({
