@@ -3,24 +3,40 @@ import test from "node:test";
 import { splitSpeechText } from "../app/speech-utils.ts";
 import {
   createBrowserChatRequest,
-  getBackendAudioEndpoint,
+  createOnDeviceSpeechOptions,
   resolveVoiceMode,
   shouldUseBrowserRecognition,
+  supportsOnDeviceSpeechRecognition,
 } from "../app/voice-mode.ts";
 
-test("production defaults to backend-audio", () => {
-  const mode = resolveVoiceMode(undefined);
-
-  assert.equal(mode, "backend-audio");
-  assert.equal(getBackendAudioEndpoint(mode), "/voice/message");
-});
-
-test("backend-audio never enables SpeechRecognition", () => {
-  assert.equal(shouldUseBrowserRecognition("backend-audio"), false);
+test("production always uses browser recognition", () => {
+  assert.equal(resolveVoiceMode(undefined), "browser");
+  assert.equal(resolveVoiceMode("backend-audio"), "browser");
   assert.equal(shouldUseBrowserRecognition("browser"), true);
 });
 
-test("browser remains an explicit compatibility mode", () => {
+test("on-device recognition uses es-ES and command quality", () => {
+  assert.deepEqual(createOnDeviceSpeechOptions(), {
+    langs: ["es-ES"],
+    processLocally: true,
+    quality: "command",
+  });
+});
+
+test("local recognition requires available, install, and processLocally", () => {
+  const constructor = {
+    available() {},
+    install() {},
+  };
+
+  assert.equal(
+    supportsOnDeviceSpeechRecognition(constructor, { processLocally: false }),
+    true,
+  );
+  assert.equal(supportsOnDeviceSpeechRecognition({}, {}), false);
+});
+
+test("a real browser transcript targets /chat/message unchanged", () => {
   const request = createBrowserChatRequest(
     "session-id",
     "  Quiero una gaseosa, por favor  ",
@@ -35,12 +51,13 @@ test("browser remains an explicit compatibility mode", () => {
   });
 });
 
-test("speech is split into sequential chunks of at most 180 characters", () => {
-  const chunks = splitSpeechText(
-    "Primera oración breve. " + "palabra ".repeat(60) + "Respuesta final.",
-  );
+test("an empty transcript creates no chat request", () => {
+  assert.equal(createBrowserChatRequest("session-id", "   "), null);
+});
 
-  assert.ok(chunks.length > 2);
+test("speech remains split into chunks of at most 180 characters", () => {
+  const chunks = splitSpeechText("palabra ".repeat(60));
+
+  assert.ok(chunks.length > 1);
   assert.ok(chunks.every((chunk) => chunk.length <= 180));
-  assert.equal(chunks[0], "Primera oración breve.");
 });

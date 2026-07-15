@@ -1,4 +1,10 @@
-export type VoiceMode = "browser" | "backend-audio";
+export type VoiceMode = "browser";
+
+export type OnDeviceSpeechOptions = {
+  langs: string[];
+  processLocally: true;
+  quality: "command";
+};
 
 export type BrowserChatRequest = {
   path: "/chat/message";
@@ -9,13 +15,31 @@ export type BrowserChatRequest = {
 };
 
 export function resolveVoiceMode(configuredMode?: string): VoiceMode {
-  return configuredMode?.trim().toLowerCase() === "browser"
-    ? "browser"
-    : "backend-audio";
+  void configuredMode;
+  return "browser";
 }
 
 export function shouldUseBrowserRecognition(mode: VoiceMode): boolean {
   return mode === "browser";
+}
+
+export function createOnDeviceSpeechOptions(): OnDeviceSpeechOptions {
+  return {
+    langs: ["es-ES"],
+    processLocally: true,
+    quality: "command",
+  };
+}
+
+export function supportsOnDeviceSpeechRecognition(
+  constructor: { available?: unknown; install?: unknown },
+  recognition: object,
+): boolean {
+  return (
+    typeof constructor.available === "function" &&
+    typeof constructor.install === "function" &&
+    "processLocally" in recognition
+  );
 }
 
 export function createBrowserChatRequest(
@@ -35,10 +59,4 @@ export function createBrowserChatRequest(
       message,
     },
   };
-}
-
-export function getBackendAudioEndpoint(
-  mode: VoiceMode,
-): "/voice/message" | null {
-  return mode === "backend-audio" ? "/voice/message" : null;
 }
