@@ -22,6 +22,7 @@ export class OrderItemResponseDto {
 
 export class OrderResponseDto {
   id: string;
+  orderCode: string;
   sessionId: string;
   status: string;
   subtotal: string;

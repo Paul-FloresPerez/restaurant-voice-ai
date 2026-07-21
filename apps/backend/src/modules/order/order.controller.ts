@@ -1,7 +1,17 @@
-import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+} from '@nestjs/common';
 import { AddOrderItemDto } from './dto/add-order-item.dto';
 import { CreateCurrentOrderDto } from './dto/create-current-order.dto';
 import { OrderResponseDto } from './dto/order-response.dto';
+import { UpdateKitchenStatusDto } from './dto/update-kitchen-status.dto';
 import { UpdateOrderItemDto } from './dto/update-order-item.dto';
 import { OrderService } from './order.service';
 
@@ -19,6 +29,11 @@ export class OrderController {
     @Param('sessionId', new ParseUUIDPipe()) sessionId: string,
   ): Promise<OrderResponseDto> {
     return this.orderService.findCurrent(sessionId);
+  }
+
+  @Get('kitchen')
+  findKitchenOrders(): Promise<OrderResponseDto[]> {
+    return this.orderService.findKitchenOrders();
   }
 
   @Post(':orderId/items')
@@ -51,5 +66,13 @@ export class OrderController {
     @Param('orderId', new ParseUUIDPipe()) orderId: string,
   ): Promise<OrderResponseDto> {
     return this.orderService.confirm(orderId);
+  }
+
+  @Patch(':orderId/status')
+  updateKitchenStatus(
+    @Param('orderId', new ParseUUIDPipe()) orderId: string,
+    @Body() dto: UpdateKitchenStatusDto,
+  ): Promise<OrderResponseDto> {
+    return this.orderService.updateKitchenStatus(orderId, dto.status);
   }
 }

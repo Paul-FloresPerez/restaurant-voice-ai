@@ -15,6 +15,14 @@ import { AddOrderItemDto } from './dto/add-order-item.dto';
 import { OrderItemModifierDto } from './dto/order-item-modifier.dto';
 import { OrderResponseDto } from './dto/order-response.dto';
 import { UpdateOrderItemDto } from './dto/update-order-item.dto';
+import {
+  activeKitchenDatabaseStatuses,
+  isValidKitchenTransition,
+  KitchenStatus,
+  toApiKitchenStatus,
+  toDatabaseKitchenStatus,
+} from './kitchen-status';
+import { createOrderCode } from './order-code';
 
 const orderInclude = {
   order_items: {
@@ -78,10 +86,15 @@ export class OrderService {
           include: orderInclude,
         });
 
-        await this.createOrderEvent(tx, createdOrder.id, order_event_type.ADD_NOTE, {
-          action: 'CREATE_DRAFT_ORDER',
-          sessionId,
-        });
+        await this.createOrderEvent(
+          tx,
+          createdOrder.id,
+          order_event_type.ADD_NOTE,
+          {
+            action: 'CREATE_DRAFT_ORDER',
+            sessionId,
+          },
+        );
 
         return createdOrder;
       },
@@ -108,7 +121,10 @@ export class OrderService {
     return this.toOrderResponse(order);
   }
 
-  async addItem(orderId: string, dto: AddOrderItemDto): Promise<OrderResponseDto> {
+  async addItem(
+    orderId: string,
+    dto: AddOrderItemDto,
+  ): Promise<OrderResponseDto> {
     const order = await this.prisma.$transaction(async (tx) => {
       await this.assertDraftOrder(tx, orderId);
 
@@ -290,7 +306,15 @@ export class OrderService {
 
   async confirm(orderId: string): Promise<OrderResponseDto> {
     const order = await this.prisma.$transaction(async (tx) => {
-      const draftOrder = await this.assertDraftOrder(tx, orderId);
+      const draftOrder = await this.findOrderOrThrow(tx, orderId);
+
+      if (draftOrder.status === order_status.CONFIRMED) {
+        return draftOrder;
+      }
+
+      if (draftOrder.status !== order_status.DRAFT) {
+        throw new ConflictException('Only DRAFT orders can be confirmed');
+      }
 
       const itemCount = await tx.order_items.count({
         where: { order_id: draftOrder.id },
@@ -302,13 +326,27 @@ export class OrderService {
 
       await this.recalculateTotals(tx, orderId);
 
-      await tx.orders.update({
-        where: { id: orderId },
+      const confirmation = await tx.orders.updateMany({
+        where: {
+          id: orderId,
+          status: order_status.DRAFT,
+        },
         data: {
           status: order_status.CONFIRMED,
           confirmed_at: new Date(),
+          order_code: draftOrder.order_code ?? createOrderCode(orderId),
         },
       });
+
+      if (confirmation.count === 0) {
+        const currentOrder = await this.findOrderOrThrow(tx, orderId);
+
+        if (currentOrder.status === order_status.CONFIRMED) {
+          return currentOrder;
+        }
+
+        throw new ConflictException('Only DRAFT orders can be confirmed');
+      }
 
       await this.createOrderEvent(tx, orderId, order_event_type.CONFIRM_ORDER, {
         itemCount,
@@ -318,6 +356,49 @@ export class OrderService {
     });
 
     return this.toOrderResponse(order);
+  }
+
+  async findKitchenOrders(): Promise<OrderResponseDto[]> {
+    const orders = await this.prisma.orders.findMany({
+      where: {
+        status: { in: [...activeKitchenDatabaseStatuses] },
+      },
+      include: orderInclude,
+      orderBy: [{ confirmed_at: 'asc' }, { created_at: 'asc' }],
+    });
+
+    return orders.map((order) => this.toOrderResponse(order, true));
+  }
+
+  async updateKitchenStatus(
+    orderId: string,
+    requestedStatus: KitchenStatus,
+  ): Promise<OrderResponseDto> {
+    const nextStatus = toDatabaseKitchenStatus(requestedStatus);
+    const order = await this.prisma.$transaction(async (tx) => {
+      const currentOrder = await this.findOrderOrThrow(tx, orderId);
+
+      if (!isValidKitchenTransition(currentOrder.status, nextStatus)) {
+        throw new ConflictException(
+          `Invalid kitchen transition from ${toApiKitchenStatus(currentOrder.status)} to ${requestedStatus}`,
+        );
+      }
+
+      await tx.orders.update({
+        where: { id: orderId },
+        data: { status: nextStatus },
+      });
+
+      await this.createOrderEvent(tx, orderId, order_event_type.ADD_NOTE, {
+        action: 'KITCHEN_STATUS_CHANGE',
+        previousStatus: toApiKitchenStatus(currentOrder.status),
+        status: requestedStatus,
+      });
+
+      return this.findOrderOrThrow(tx, orderId);
+    });
+
+    return this.toOrderResponse(order, true);
   }
 
   private async assertActiveSession(
@@ -503,11 +584,17 @@ export class OrderService {
     return cleaned ? cleaned : null;
   }
 
-  private toOrderResponse(order: OrderWithItems): OrderResponseDto {
+  private toOrderResponse(
+    order: OrderWithItems,
+    useKitchenStatus = false,
+  ): OrderResponseDto {
     return {
       id: order.id,
+      orderCode: order.order_code ?? createOrderCode(order.id),
       sessionId: order.session_id,
-      status: order.status,
+      status: useKitchenStatus
+        ? toApiKitchenStatus(order.status)
+        : order.status,
       subtotal: order.subtotal.toString(),
       discountTotal: order.discount_total.toString(),
       taxTotal: order.tax_total.toString(),

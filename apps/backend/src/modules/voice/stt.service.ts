@@ -66,9 +66,7 @@ export class SttService {
     }
   }
 
-  private async transcribeWithGroq(
-    audio: UploadedAudioFile,
-  ): Promise<string> {
+  private async transcribeWithGroq(audio: UploadedAudioFile): Promise<string> {
     const apiKey = this.configService.get<string>('GROQ_API_KEY')?.trim();
 
     if (!apiKey) {

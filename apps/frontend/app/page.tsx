@@ -1,7 +1,15 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { splitSpeechText } from "./speech-utils";
+import {
+  canConfirmOrder,
+  confirmOrderRequest,
+  isNetworkFailure,
+  offlineDraftMessage,
+  serverConnectionMessage,
+} from "./order-flow";
 import {
   getPreferredAudioMimeType,
   maximumVoiceRecordingDurationMs,
@@ -39,6 +47,7 @@ type ChatResponse = {
   orderId: string;
   intent: string;
   assistantMessage: string;
+  order: Order;
 };
 
 type ConversationEntry = {
@@ -65,9 +74,13 @@ type OrderItem = {
 
 type Order = {
   id: string;
+  orderCode: string;
   status: string;
   total: string;
   subtotal: string;
+  confirmedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
   items: OrderItem[];
 };
 
@@ -86,6 +99,7 @@ type VoiceState =
   | "speaking"
   | "error";
 type BackendStatus = "preparing" | "ready" | "unavailable";
+type RetryAction = "record" | "confirm";
 type SpeakOptions = {
   markAsSpeaking?: boolean;
   onEnd?: () => void;
@@ -232,6 +246,11 @@ export default function Home() {
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [isLoadingMenu, setIsLoadingMenu] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [isConfirmingOrder, setIsConfirmingOrder] = useState(false);
+  const [isConfirmationOpen, setIsConfirmationOpen] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
+  const [networkMessage, setNetworkMessage] = useState<string | null>(null);
+  const [retryAction, setRetryAction] = useState<RetryAction | null>(null);
   const [isTestModeOpen, setIsTestModeOpen] = useState(false);
   const [backendStatus, setBackendStatus] =
     useState<BackendStatus>("preparing");
@@ -242,6 +261,7 @@ export default function Home() {
   const hasPlayedInitialMenuRef = useRef(false);
   const isCreatingSessionRef = useRef(false);
   const isSendingMessageRef = useRef(false);
+  const isConfirmingOrderRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const speechOutputUnlockedRef = useRef(false);
   const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
@@ -266,16 +286,21 @@ export default function Home() {
   }, [menuItems]);
 
   const sessionLabel = session ? "Activa" : "No iniciada";
+  const isOrderConfirmed = order?.status === "CONFIRMED";
   const isMicDisabled =
     backendStatus !== "ready" ||
     isCreatingSession ||
     isSendingMessage ||
+    isConfirmingOrder ||
+    isOrderConfirmed ||
     voiceState === "processing" ||
     voiceState === "speaking";
   const isChatDisabled =
     backendStatus !== "ready" ||
     isCreatingSession ||
     isSendingMessage ||
+    isConfirmingOrder ||
+    isOrderConfirmed ||
     isRecordingAudio;
   const currentVoiceStatus =
     backendStatus === "preparing"
@@ -290,6 +315,37 @@ export default function Home() {
             helper: "Recarga la página para intentar conectar nuevamente.",
           }
         : voiceStatus[voiceState];
+
+  function applyOrderResponse(nextOrder: Order | null) {
+    setOrder(nextOrder);
+    setOrderStatus(nextOrder ? "" : "Sin pedido activo.");
+
+    if (nextOrder?.status === "CONFIRMED") {
+      setIsConfirmationOpen(false);
+    } else if (nextOrder?.status === "DRAFT" && nextOrder.items.length > 0) {
+      setIsConfirmationOpen(true);
+    }
+  }
+
+  function reportNetworkProblem(action: RetryAction, message: string) {
+    setIsOnline(typeof navigator === "undefined" ? true : navigator.onLine);
+    setNetworkMessage(message);
+    setRetryAction(action);
+    setError(message);
+    setVoiceState("idle");
+  }
+
+  function canStartOnlineAction(action: RetryAction): boolean {
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      reportNetworkProblem(action, offlineDraftMessage);
+      return false;
+    }
+
+    setIsOnline(true);
+    setNetworkMessage(null);
+    setRetryAction(null);
+    return true;
+  }
 
   async function loadVoices() {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
@@ -580,6 +636,14 @@ export default function Home() {
       };
     }
 
+    const updateConnectionStatus = () => {
+      const online = navigator.onLine;
+      setIsOnline(online);
+    };
+    updateConnectionStatus();
+    window.addEventListener("online", updateConnectionStatus);
+    window.addEventListener("offline", updateConnectionStatus);
+
     return () => {
       window.cancelAnimationFrame(frameId);
       cleanupAudioCapture(false);
@@ -590,6 +654,8 @@ export default function Home() {
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.onvoiceschanged = null;
       }
+      window.removeEventListener("online", updateConnectionStatus);
+      window.removeEventListener("offline", updateConnectionStatus);
     };
     // Mount-only browser initialization. The called functions are event-style
     // helpers and should not retrigger this setup on every render.
@@ -620,6 +686,9 @@ export default function Home() {
 
       setSession(createdSession);
       setOrder(null);
+      setIsConfirmationOpen(false);
+      setNetworkMessage(null);
+      setRetryAction(null);
       setOrderStatus("Sesion creada. Aun no hay pedido activo.");
 
       if (shouldPlayWelcome) {
@@ -649,8 +718,7 @@ export default function Home() {
       const currentOrder = await apiRequest<Order>(
         `/orders/current/${sessionId}`,
       );
-      setOrder(currentOrder);
-      setOrderStatus("");
+      applyOrderResponse(currentOrder);
       return currentOrder;
     } catch (requestError) {
       setOrder(null);
@@ -706,7 +774,7 @@ export default function Home() {
           message: cleanMessage,
         }),
       });
-      void loadCurrentOrder(activeSession.id);
+      applyOrderResponse(response.order);
 
       setConversation((entries) => [
         ...entries,
@@ -716,11 +784,15 @@ export default function Home() {
         onEnd: () => setVoiceState("idle"),
       });
     } catch (requestError) {
+      const requestWasNetworkFailure =
+        didTimeOut || isNetworkFailure(requestError);
       const errorMessage = didTimeOut
         ? "La solicitud tardó más de 20 segundos. Intenta nuevamente."
-        : requestError instanceof Error
-          ? requestError.message
-          : "No se pudo enviar el mensaje.";
+        : requestWasNetworkFailure
+          ? serverConnectionMessage
+          : requestError instanceof Error
+            ? requestError.message
+            : "No se pudo enviar el mensaje.";
       const spokenError = `Luffy tuvo un problema enviando tu mensaje. ${errorMessage}. Toca nuevamente para intentarlo.`;
       setError(errorMessage);
       setVoiceState("error");
@@ -728,7 +800,9 @@ export default function Home() {
         ...entries,
         newEntry("assistant", spokenError),
       ]);
-      void loadCurrentOrder(activeSession.id);
+      if (requestWasNetworkFailure) {
+        setNetworkMessage(serverConnectionMessage);
+      }
       void speak(spokenError, { onEnd: () => setVoiceState("idle") });
     } finally {
       window.clearTimeout(timeoutId);
@@ -753,6 +827,9 @@ export default function Home() {
 
   async function runQuickAction(text: string) {
     unlockSpeechOutput();
+    if (text === "confirmo mi pedido") {
+      setIsConfirmationOpen(true);
+    }
     let activeSession = session;
 
     if (!activeSession) {
@@ -764,6 +841,85 @@ export default function Home() {
     }
 
     await sendChatMessage(text, activeSession);
+  }
+
+  async function confirmCurrentOrder() {
+    if (isConfirmingOrderRef.current) {
+      return;
+    }
+
+    if (!order?.id) {
+      setError("No existe un pedido válido para confirmar.");
+      return;
+    }
+
+    if (order.items.length === 0) {
+      setError("No se puede confirmar un pedido vacío.");
+      return;
+    }
+
+    if (!canConfirmOrder(order, isConfirmingOrder)) {
+      return;
+    }
+
+    if (!canStartOnlineAction("confirm")) {
+      return;
+    }
+
+    isConfirmingOrderRef.current = true;
+    setIsConfirmingOrder(true);
+    setVoiceState("processing");
+    setError(null);
+
+    try {
+      const confirmedOrder = await confirmOrderRequest(apiUrl, order);
+
+      if (confirmedOrder.status !== "CONFIRMED") {
+        throw new Error("El servidor no confirmó el pedido.");
+      }
+
+      applyOrderResponse(confirmedOrder);
+      setNetworkMessage(null);
+      setRetryAction(null);
+      setConversation((entries) => [
+        ...entries,
+        newEntry("assistant", "Pedido confirmado y enviado a cocina."),
+      ]);
+      void speak("Perfecto, tu pedido fue confirmado y enviado a cocina.", {
+        onEnd: () => setVoiceState("idle"),
+      });
+    } catch (requestError) {
+      const message =
+        isNetworkFailure(requestError) ||
+        (requestError instanceof Error &&
+          requestError.message.includes("20 segundos"))
+          ? serverConnectionMessage
+          : requestError instanceof Error
+            ? requestError.message
+            : "No se pudo confirmar el pedido.";
+
+      if (message === serverConnectionMessage) {
+        reportNetworkProblem("confirm", message);
+      } else {
+        setError(message);
+        setVoiceState("idle");
+      }
+    } finally {
+      isConfirmingOrderRef.current = false;
+      setIsConfirmingOrder(false);
+    }
+  }
+
+  async function retryNetworkAction() {
+    const action = retryAction;
+    setNetworkMessage(null);
+    setRetryAction(null);
+
+    if (action === "confirm") {
+      await confirmCurrentOrder();
+    } else if (action === "record") {
+      await handleMainTouch();
+    }
   }
 
   function cleanupAudioCapture(shouldUpdateState = true) {
@@ -811,6 +967,10 @@ export default function Home() {
       mediaRecorderRef.current?.state === "recording" ||
       activeVoiceRequestRef.current
     ) {
+      return;
+    }
+
+    if (!canStartOnlineAction("record")) {
       return;
     }
 
@@ -1002,8 +1162,7 @@ export default function Home() {
       }
 
       if ("order" in voiceResponse) {
-        setOrder(voiceResponse.order ?? null);
-        setOrderStatus(voiceResponse.order ? "" : "Sin pedido activo.");
+        applyOrderResponse(voiceResponse.order ?? null);
       } else {
         await loadCurrentOrder(voiceResponse.sessionId || sessionId);
       }
@@ -1019,6 +1178,11 @@ export default function Home() {
         onEnd: () => setVoiceState("idle"),
       });
     } catch (sendError) {
+      if (didTimeOut || isNetworkFailure(sendError)) {
+        reportNetworkProblem("record", serverConnectionMessage);
+        return;
+      }
+
       const detail = didTimeOut
         ? "La solicitud tardó más de 45 segundos. Intenta nuevamente."
         : sendError instanceof TypeError
@@ -1067,6 +1231,10 @@ export default function Home() {
       return;
     }
 
+    if (!canStartOnlineAction("record")) {
+      return;
+    }
+
     let activeSession = session;
 
     if (!activeSession) {
@@ -1099,6 +1267,17 @@ export default function Home() {
           </div>
 
           <div className="flex items-center gap-3">
+            {!isOnline ? (
+              <span className="rounded-md bg-amber-950 px-3 py-2 text-amber-100">
+                Sin conexión
+              </span>
+            ) : null}
+            <Link
+              href="/cocina"
+              className="min-h-12 rounded-md border border-white/20 px-4 py-3 text-lg font-semibold"
+            >
+              Cocina
+            </Link>
             <div className="rounded-md border border-white/15 bg-black px-4 py-2">
               <p className="text-xs uppercase text-neutral-400">
                 Estado de sesion
@@ -1137,6 +1316,21 @@ export default function Home() {
               ? "Preparando a Luffy..."
               : "Luffy no está disponible"}
         </div>
+
+        {networkMessage ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-300/50 bg-amber-950 px-5 py-4 text-lg text-amber-100">
+            <p>{networkMessage}</p>
+            {retryAction ? (
+              <button
+                type="button"
+                onClick={() => void retryNetworkAction()}
+                className="min-h-11 rounded-md border border-amber-200 px-4 font-semibold"
+              >
+                Reintentar
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
         {error ? (
           <div
@@ -1228,7 +1422,14 @@ export default function Home() {
               disabled={isChatDisabled}
               onAction={(text) => void runQuickAction(text)}
             />
-            <OrderPanel order={order} orderStatus={orderStatus} />
+            <OrderPanel
+              order={order}
+              orderStatus={orderStatus}
+              isConfirmationOpen={isConfirmationOpen}
+              isConfirmingOrder={isConfirmingOrder}
+              onConfirm={() => void confirmCurrentOrder()}
+              onContinueEditing={() => setIsConfirmationOpen(false)}
+            />
             <MenuSummary groupedMenu={groupedMenu} isLoadingMenu={isLoadingMenu} />
           </aside>
         </section>
@@ -1369,9 +1570,17 @@ function ConversationPreview({
 function OrderPanel({
   order,
   orderStatus,
+  isConfirmationOpen,
+  isConfirmingOrder,
+  onConfirm,
+  onContinueEditing,
 }: {
   order: Order | null;
   orderStatus: string;
+  isConfirmationOpen: boolean;
+  isConfirmingOrder: boolean;
+  onConfirm: () => void;
+  onContinueEditing: () => void;
 }) {
   return (
     <section className="rounded-md border border-white/15 bg-neutral-900 p-4">
@@ -1428,6 +1637,66 @@ function OrderPanel({
           <p className="text-lg leading-8 text-neutral-300">{orderStatus}</p>
         )}
       </div>
+
+      {order?.status === "DRAFT" &&
+      order.items.length > 0 &&
+      isConfirmationOpen ? (
+        <div className="mt-4 rounded-md border border-amber-300/50 bg-amber-950 p-4">
+          <h3 className="text-xl font-semibold text-amber-100">
+            Confirmación final
+          </h3>
+          <p className="mt-2 text-amber-50">
+            Revisa el resumen antes de enviar el pedido a cocina.
+          </p>
+          <div className="mt-4 grid gap-3">
+            <button
+              type="button"
+              onClick={onConfirm}
+              disabled={isConfirmingOrder}
+              className="min-h-14 rounded-md bg-emerald-300 px-4 text-lg font-semibold text-neutral-950 disabled:bg-neutral-600"
+            >
+              {isConfirmingOrder
+                ? "Confirmando..."
+                : "Confirmar y enviar a cocina"}
+            </button>
+            <button
+              type="button"
+              onClick={onContinueEditing}
+              disabled={isConfirmingOrder}
+              className="min-h-12 rounded-md border border-white/30 px-4 text-lg font-semibold disabled:text-neutral-500"
+            >
+              Seguir modificando
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {order?.status === "CONFIRMED" ? (
+        <div
+          role="status"
+          className="mt-4 rounded-md border border-emerald-300/60 bg-emerald-950 p-4 text-emerald-50"
+        >
+          <h3 className="text-2xl font-semibold">Pedido enviado a cocina</h3>
+          <p className="mt-2 text-lg font-semibold">
+            Código: #{order.orderCode || order.id.slice(0, 8).toUpperCase()}
+          </p>
+          <ul className="mt-3 space-y-1">
+            {order.items.map((item) => (
+              <li key={item.id}>
+                {item.quantity} × {item.itemName}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 text-xl font-semibold">
+            Total: {formatMoney(order.total)}
+          </p>
+          <p className="mt-2 text-sm text-emerald-100">
+            Confirmado: {order.confirmedAt
+              ? new Date(order.confirmedAt).toLocaleString("es-PE")
+              : "Fecha no disponible"}
+          </p>
+        </div>
+      ) : null}
     </section>
   );
 }

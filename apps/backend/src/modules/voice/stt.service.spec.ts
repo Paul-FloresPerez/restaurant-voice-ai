@@ -45,17 +45,13 @@ describe('SttService providers', () => {
       }),
     );
 
-    await expect(service.transcribe(audio)).resolves.toBe(
-      'quiero una gaseosa',
-    );
+    await expect(service.transcribe(audio)).resolves.toBe('quiero una gaseosa');
 
     const [url, request] = fetchMock.mock.calls[0];
     const body = request?.body as FormData;
     const file = body.get('file');
 
-    expect(url).toBe(
-      'https://api.groq.com/openai/v1/audio/transcriptions',
-    );
+    expect(url).toBe('https://api.groq.com/openai/v1/audio/transcriptions');
     expect(request?.method).toBe('POST');
     expect(request?.headers).toEqual({ Authorization: 'Bearer test-key' });
     expect(file).toBeInstanceOf(Blob);
@@ -67,7 +63,9 @@ describe('SttService providers', () => {
   });
 
   it('returns the controlled message when Groq fails', async () => {
-    jest.spyOn(global, 'fetch').mockResolvedValue(new Response(null, { status: 503 }));
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 503 }));
     const service = new SttService(
       configService({
         STT_PROVIDER: 'groq',
@@ -97,9 +95,7 @@ describe('SttService providers', () => {
   });
 
   it('returns 503 for the legacy browser provider', async () => {
-    const service = new SttService(
-      configService({ STT_PROVIDER: 'browser' }),
-    );
+    const service = new SttService(configService({ STT_PROVIDER: 'browser' }));
 
     await expect(service.transcribe(audio)).rejects.toBeInstanceOf(
       ServiceUnavailableException,

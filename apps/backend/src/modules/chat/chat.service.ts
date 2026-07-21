@@ -13,6 +13,7 @@ import {
   AiService,
 } from '../ai/ai.service';
 import { OrderResponseDto } from '../order/dto/order-response.dto';
+import { createOrderCode } from '../order/order-code';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   ChatIntent,
@@ -167,12 +168,7 @@ export class ChatService {
           order = result.order;
           assistantMessage = result.assistantMessage;
         } else if (intent === 'CANCEL_ITEM') {
-          const result = await this.removeRequestedItem(
-            tx,
-            order,
-            dto.message,
-            aiInterpretation,
-          );
+          const result = await this.removeRequestedItem(tx, order, dto.message);
           order = result.order;
           assistantMessage = result.assistantMessage;
         } else if (intent === 'CONFIRM_ORDER') {
@@ -412,7 +408,9 @@ export class ChatService {
     }
 
     const normalizedMessage = this.normalize(message);
-    const numericQuantity = normalizedMessage.match(/(?:^|\s)(\d{1,2})(?:\s|$)/);
+    const numericQuantity = normalizedMessage.match(
+      /(?:^|\s)(\d{1,2})(?:\s|$)/,
+    );
 
     if (numericQuantity) {
       return Number(numericQuantity[1]);
@@ -441,14 +439,16 @@ export class ChatService {
       return { intent: 'CONFIRM_ORDER', confirmationType: 'closure' };
     }
 
-    if (this.containsAny(normalizedMessage, [
-      'repiteme mi pedido',
-      'repite mi pedido',
-      'resumen',
-      'que pedi',
-      'mi pedido',
-      'mi orden',
-    ])) {
+    if (
+      this.containsAny(normalizedMessage, [
+        'repiteme mi pedido',
+        'repite mi pedido',
+        'resumen',
+        'que pedi',
+        'mi pedido',
+        'mi orden',
+      ])
+    ) {
       return { intent: 'ORDER_SUMMARY', confirmationType: null };
     }
 
@@ -579,6 +579,7 @@ export class ChatService {
       data: {
         status: order_status.CONFIRMED,
         confirmed_at: new Date(),
+        order_code: createOrderCode(orderId),
       },
     });
 
@@ -668,7 +669,6 @@ export class ChatService {
     tx: TxClient,
     order: OrderWithItems,
     message: string,
-    aiInterpretation: AiInterpretation | null,
   ): Promise<{ order: OrderWithItems; assistantMessage: string }> {
     if (order.order_items.length === 0) {
       return {
@@ -1036,7 +1036,7 @@ export class ChatService {
     normalizedMessage: string,
   ): number {
     return productSynonyms.reduce((bestScore, synonym) => {
-      const isRequested = synonym.phrases.some((phrase) =>
+      const isRequested = synonym.phrases.some((phrase: string) =>
         this.containsPhrase(normalizedMessage, phrase),
       );
 
@@ -1178,7 +1178,7 @@ export class ChatService {
       if (
         productSynonyms.some(
           (synonym) =>
-            synonym.phrases.some((phrase) =>
+            synonym.phrases.some((phrase: string) =>
               this.containsPhrase(normalizedMessage, phrase),
             ) &&
             this.normalize(normalizedTerm) ===
@@ -1204,7 +1204,7 @@ export class ChatService {
 
   private hasProductSynonym(normalizedMessage: string): boolean {
     return productSynonyms.some((synonym) =>
-      synonym.phrases.some((phrase) =>
+      synonym.phrases.some((phrase: string) =>
         this.containsPhrase(normalizedMessage, phrase),
       ),
     );
@@ -1217,7 +1217,10 @@ export class ChatService {
     return this.normalize(item.name) === this.normalize(canonicalName);
   }
 
-  private matchesCategory(normalizedMessage: string, categoryName: string): boolean {
+  private matchesCategory(
+    normalizedMessage: string,
+    categoryName: string,
+  ): boolean {
     const normalizedCategoryName = this.normalize(categoryName);
 
     return this.containsPhrase(normalizedMessage, normalizedCategoryName);
@@ -1242,18 +1245,26 @@ export class ChatService {
       return false;
     }
 
-    const maximumDistance = Math.max(value.length, candidate.length) >= 7 ? 2 : 1;
+    const maximumDistance =
+      Math.max(value.length, candidate.length) >= 7 ? 2 : 1;
 
     return this.levenshteinDistance(value, candidate) <= maximumDistance;
   }
 
   private levenshteinDistance(first: string, second: string): number {
-    let previousRow = Array.from({ length: second.length + 1 }, (_, index) => index);
+    let previousRow = Array.from(
+      { length: second.length + 1 },
+      (_, index) => index,
+    );
 
     for (let firstIndex = 1; firstIndex <= first.length; firstIndex += 1) {
       const currentRow = [firstIndex];
 
-      for (let secondIndex = 1; secondIndex <= second.length; secondIndex += 1) {
+      for (
+        let secondIndex = 1;
+        secondIndex <= second.length;
+        secondIndex += 1
+      ) {
         currentRow[secondIndex] = Math.min(
           currentRow[secondIndex - 1] + 1,
           previousRow[secondIndex] + 1,
@@ -1393,6 +1404,7 @@ export class ChatService {
   private toOrderResponse(order: OrderWithItems): OrderResponseDto {
     return {
       id: order.id,
+      orderCode: order.order_code ?? createOrderCode(order.id),
       sessionId: order.session_id,
       status: order.status,
       subtotal: order.subtotal.toString(),

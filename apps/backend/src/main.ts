@@ -26,18 +26,23 @@ async function bootstrap() {
   console.log('Allowed CORS origins:', allowedOrigins);
 
   app.enableCors({
-    origin: (origin, callback) => {
+    origin: (
+      origin: string | undefined,
+      callback: (error: Error | null, allow?: boolean) => void,
+    ): void => {
       if (!origin) {
-        return callback(null, true);
+        callback(null, true);
+        return;
       }
 
       const normalizedOrigin = normalizeOrigin(origin);
 
       if (normalizedOrigin && allowedOrigins.includes(normalizedOrigin)) {
-        return callback(null, true);
+        callback(null, true);
+        return;
       }
 
-      return callback(new Error(`CORS blocked origin: ${origin}`), false);
+      callback(new Error(`CORS blocked origin: ${origin}`), false);
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -53,4 +58,4 @@ async function bootstrap() {
   const port = process.env.PORT || 3001;
   await app.listen(port, '0.0.0.0');
 }
-bootstrap();
+void bootstrap();

@@ -33,3 +33,5 @@ apps/backend/prisma/dev.db-journal
 # Cache
 .cache/
 .turbo/apps/backend/generated/
+.vercel
+.env*
