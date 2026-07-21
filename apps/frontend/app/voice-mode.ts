@@ -1,62 +1,19 @@
-export type VoiceMode = "browser";
+export const voiceMessageEndpoint = "/voice/message";
+export const maximumVoiceRecordingDurationMs = 15_000;
+export const voiceMessageTimeoutMs = 45_000;
 
-export type OnDeviceSpeechOptions = {
-  langs: string[];
-  processLocally: true;
-  quality: "command";
-};
+const supportedAudioMimeTypes = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+] as const;
 
-export type BrowserChatRequest = {
-  path: "/chat/message";
-  body: {
-    sessionId: string;
-    message: string;
-  };
-};
+export type SupportedAudioMimeType = (typeof supportedAudioMimeTypes)[number];
 
-export function resolveVoiceMode(configuredMode?: string): VoiceMode {
-  void configuredMode;
-  return "browser";
-}
-
-export function shouldUseBrowserRecognition(mode: VoiceMode): boolean {
-  return mode === "browser";
-}
-
-export function createOnDeviceSpeechOptions(): OnDeviceSpeechOptions {
-  return {
-    langs: ["es-ES"],
-    processLocally: true,
-    quality: "command",
-  };
-}
-
-export function supportsOnDeviceSpeechRecognition(
-  constructor: { available?: unknown; install?: unknown },
-  recognition: object,
-): boolean {
+export function getPreferredAudioMimeType(
+  isTypeSupported: (mimeType: string) => boolean,
+): SupportedAudioMimeType | null {
   return (
-    typeof constructor.available === "function" &&
-    typeof constructor.install === "function" &&
-    "processLocally" in recognition
+    supportedAudioMimeTypes.find((mimeType) => isTypeSupported(mimeType)) ??
+    null
   );
-}
-
-export function createBrowserChatRequest(
-  sessionId: string,
-  transcript: string,
-): BrowserChatRequest | null {
-  const message = transcript.trim();
-
-  if (!sessionId || !message) {
-    return null;
-  }
-
-  return {
-    path: "/chat/message",
-    body: {
-      sessionId,
-      message,
-    },
-  };
 }

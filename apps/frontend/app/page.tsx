@@ -3,11 +3,10 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { splitSpeechText } from "./speech-utils";
 import {
-  createBrowserChatRequest,
-  createOnDeviceSpeechOptions,
-  resolveVoiceMode,
-  shouldUseBrowserRecognition,
-  supportsOnDeviceSpeechRecognition,
+  getPreferredAudioMimeType,
+  maximumVoiceRecordingDurationMs,
+  voiceMessageEndpoint,
+  voiceMessageTimeoutMs,
 } from "./voice-mode";
 
 type Session = {
@@ -72,6 +71,14 @@ type Order = {
   items: OrderItem[];
 };
 
+type VoiceMessageResponse = {
+  sessionId: string;
+  transcription: string;
+  assistantMessage: string;
+  intent: string;
+  order?: Order | null;
+};
+
 type VoiceState =
   | "idle"
   | "listening"
@@ -79,90 +86,26 @@ type VoiceState =
   | "speaking"
   | "error";
 type BackendStatus = "preparing" | "ready" | "unavailable";
-type SpeechRecognitionAvailabilityStatus =
-  | "unavailable"
-  | "downloadable"
-  | "downloading"
-  | "available";
-
-type SpeechRecognitionAlternativeLike = {
-  transcript: string;
-};
-
-type SpeechRecognitionResultLike = {
-  0: SpeechRecognitionAlternativeLike;
-  isFinal: boolean;
-};
-
-type SpeechRecognitionEventLike = Event & {
-  resultIndex: number;
-  results: {
-    length: number;
-    [index: number]: SpeechRecognitionResultLike;
-  };
-};
-
-type SpeechRecognitionErrorEventLike = Event & {
-  error: string;
-};
-
-type SpeechRecognitionLike = EventTarget & {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  maxAlternatives: number;
-  processLocally?: boolean;
-  onstart: (() => void) | null;
-  onend: (() => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-};
-
-type SpeechRecognitionConstructor = {
-  new (): SpeechRecognitionLike;
-  available?: (
-    options: ReturnType<typeof createOnDeviceSpeechOptions>,
-  ) => Promise<SpeechRecognitionAvailabilityStatus>;
-  install?: (
-    options: ReturnType<typeof createOnDeviceSpeechOptions>,
-  ) => Promise<boolean>;
-};
 type SpeakOptions = {
   markAsSpeaking?: boolean;
   onEnd?: () => void;
 };
 
-declare global {
-  interface Window {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  }
-}
-
 const apiUrl = (
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001"
 ).replace(/\/$/, "");
-const voiceMode = resolveVoiceMode(process.env.NEXT_PUBLIC_VOICE_MODE);
 
 const luffyIntro =
   "Hola, soy Luffy, tu mesero virtual. Puedo leerte la carta, agregar o quitar productos y ayudarte a confirmar tu pedido. ¿Qué deseas ordenar?";
 
-const micOffMessage = "Microfono apagado. Toca para hablar nuevamente.";
-const noVoiceMessage =
-  "No detecte tu voz. Toca nuevamente el centro de la pantalla para intentarlo.";
 const noPermissionMessage =
   "No tengo permiso para usar el microfono. Activa el permiso del navegador o usa el modo prueba.";
 const noAudioCaptureMessage =
   "No encuentro un microfono disponible. Revisa el dispositivo de audio o usa el modo prueba.";
-const recognitionNetworkMessage =
-  "No se pudo iniciar el reconocimiento. Intenta nuevamente o usa el modo texto.";
-const notUnderstoodMessage =
-  "No pude entenderte. Puedes decir: leer carta, bebidas, comida o repetir mi pedido.";
-const unsupportedRecognitionMessage =
-  "Este navegador no permite reconocimiento de voz aqui. Usa Chrome o Edge, activa permisos, o usa el modo prueba.";
+const unsupportedMediaRecorderMessage =
+  "Este navegador no permite grabar audio WebM. Usa el modo texto o los botones rapidos.";
+const audioSendErrorMessage =
+  "No pude enviar el audio al servidor. Usa los botones rapidos o el modo prueba.";
 const noSessionForAudioMessage =
   "No existe una sesion activa para enviar audio. Intenta iniciar nuevamente.";
 
@@ -180,13 +123,12 @@ const voiceStatus: Record<VoiceState, { title: string; helper: string }> = {
     helper: "Luffy iniciara la sesion y te guiara paso a paso.",
   },
   listening: {
-    title: "Escuchando...",
-    helper:
-      "Habla ahora. Puedes decir: leer carta, hamburguesas, bebidas o repetir pedido.",
+    title: "Te escucho",
+    helper: "Te escucho. Toca nuevamente para enviar.",
   },
   processing: {
-    title: "Procesando tu solicitud...",
-    helper: "Luffy esta preparando o enviando tu solicitud.",
+    title: "Procesando tu pedido...",
+    helper: "Procesando tu pedido...",
   },
   speaking: {
     title: "Luffy está respondiendo...",
@@ -254,14 +196,6 @@ function newEntry(role: ConversationEntry["role"], text: string) {
   };
 }
 
-function getRecognitionConstructor() {
-  if (typeof window === "undefined") {
-    return undefined;
-  }
-
-  return window.SpeechRecognition ?? window.webkitSpeechRecognition;
-}
-
 function pickSpanishVoice(voices: SpeechSynthesisVoice[]) {
   const languagePriority = ["es-pe", "es-mx", "es-us", "es-es"];
   const spanishVoices = voices.filter((voice) =>
@@ -299,29 +233,27 @@ export default function Home() {
   const [isLoadingMenu, setIsLoadingMenu] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isTestModeOpen, setIsTestModeOpen] = useState(false);
-  const [clientReady, setClientReady] = useState(false);
   const [backendStatus, setBackendStatus] =
     useState<BackendStatus>("preparing");
-  const [speechSupported, setSpeechSupported] = useState(false);
-  const [isPreparingLocalRecognition, setIsPreparingLocalRecognition] =
-    useState(false);
-  const [localRecognitionMessage, setLocalRecognitionMessage] = useState("");
+  const [mediaRecorderSupported, setMediaRecorderSupported] = useState(false);
+  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
   const [selectedVoiceLabel, setSelectedVoiceLabel] =
     useState("Voz no seleccionada");
-  const [lastRecognitionError, setLastRecognitionError] =
-    useState("Sin errores");
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const finalTranscriptRef = useRef("");
-  const ignoreNextEndRef = useRef(false);
-  const lastMicErrorRef = useRef<string | null>(null);
   const hasPlayedInitialMenuRef = useRef(false);
   const isCreatingSessionRef = useRef(false);
   const isSendingMessageRef = useRef(false);
-  const isListeningRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const speechOutputUnlockedRef = useRef(false);
   const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const activeSpeechTextRef = useRef<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const maxRecordingTimeoutRef = useRef<number | null>(null);
+  const isStartingAudioRef = useRef(false);
+  const isStoppingAudioRef = useRef(false);
+  const activeVoiceRequestRef = useRef<string | null>(null);
+  const voiceRequestAbortControllerRef = useRef<AbortController | null>(null);
   const speechRunIdRef = useRef(0);
   const speechTimeoutRef = useRef<number | null>(null);
 
@@ -335,18 +267,16 @@ export default function Home() {
 
   const sessionLabel = session ? "Activa" : "No iniciada";
   const isMicDisabled =
-    !clientReady ||
     backendStatus !== "ready" ||
     isCreatingSession ||
     isSendingMessage ||
-    isPreparingLocalRecognition ||
-    voiceState === "listening" ||
     voiceState === "processing" ||
     voiceState === "speaking";
   const isChatDisabled =
     backendStatus !== "ready" ||
     isCreatingSession ||
-    isSendingMessage;
+    isSendingMessage ||
+    isRecordingAudio;
   const currentVoiceStatus =
     backendStatus === "preparing"
       ? {
@@ -374,6 +304,7 @@ export default function Home() {
       setSelectedVoiceLabel(
         voice ? `${voice.name} (${voice.lang})` : "Voz no disponible",
       );
+      console.log("Voz de Luffy seleccionada:", voice?.name, voice?.lang);
     }
 
     return selectedVoiceRef.current;
@@ -390,6 +321,16 @@ export default function Home() {
 
     window.speechSynthesis.resume();
     speechOutputUnlockedRef.current = true;
+  }
+
+  function canUseMediaRecorder() {
+    return (
+      typeof window !== "undefined" &&
+      "MediaRecorder" in window &&
+      Boolean(navigator.mediaDevices?.getUserMedia) &&
+      getPreferredAudioMimeType(MediaRecorder.isTypeSupported.bind(MediaRecorder)) !==
+        null
+    );
   }
 
   function getAvailableVoices(): Promise<SpeechSynthesisVoice[]> {
@@ -448,17 +389,13 @@ export default function Home() {
       return;
     }
 
-    if (isListeningRef.current) {
+    if (mediaRecorderRef.current?.state === "recording") {
       options.onEnd?.();
       return;
     }
 
     if (isSpeakingRef.current && activeSpeechTextRef.current === cleanText) {
       return;
-    }
-
-    if (recognitionRef.current) {
-      stopRecognition();
     }
 
     unlockSpeechOutput();
@@ -546,19 +483,6 @@ export default function Home() {
     speakChunk(0);
   }
 
-  function stopRecognition() {
-    if (!recognitionRef.current) {
-      return;
-    }
-
-    ignoreNextEndRef.current = true;
-    isListeningRef.current = false;
-    try {
-      recognitionRef.current.abort();
-    } catch {}
-    recognitionRef.current = null;
-  }
-
   async function loadMenu(): Promise<MenuItem[]> {
     setIsLoadingMenu(true);
     setError(null);
@@ -641,11 +565,7 @@ export default function Home() {
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
-      setClientReady(true);
-      setSpeechSupported(
-        shouldUseBrowserRecognition(voiceMode) &&
-          Boolean(getRecognitionConstructor()),
-      );
+      setMediaRecorderSupported(canUseMediaRecorder());
       void loadVoices();
       void prepareBackend().then((isReady) => {
         if (isReady) {
@@ -662,10 +582,11 @@ export default function Home() {
 
     return () => {
       window.cancelAnimationFrame(frameId);
-      if (shouldUseBrowserRecognition(voiceMode)) {
-        stopRecognition();
-      }
+      cleanupAudioCapture(false);
       cancelSpeechOutput();
+      voiceRequestAbortControllerRef.current?.abort();
+      voiceRequestAbortControllerRef.current = null;
+      activeVoiceRequestRef.current = null;
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.onvoiceschanged = null;
       }
@@ -769,15 +690,23 @@ export default function Home() {
     setError(null);
     setConversation((entries) => [...entries, newEntry("user", cleanMessage)]);
 
+    const abortController = new AbortController();
+    let didTimeOut = false;
+    const timeoutId = window.setTimeout(() => {
+      didTimeOut = true;
+      abortController.abort();
+    }, 20000);
+
     try {
       const response = await apiRequest<ChatResponse>(path, {
         method: "POST",
+        signal: abortController.signal,
         body: JSON.stringify({
           sessionId: activeSession.id,
           message: cleanMessage,
         }),
       });
-      await loadCurrentOrder(activeSession.id);
+      void loadCurrentOrder(activeSession.id);
 
       setConversation((entries) => [
         ...entries,
@@ -787,8 +716,9 @@ export default function Home() {
         onEnd: () => setVoiceState("idle"),
       });
     } catch (requestError) {
-      const errorMessage =
-        requestError instanceof Error
+      const errorMessage = didTimeOut
+        ? "La solicitud tardó más de 20 segundos. Intenta nuevamente."
+        : requestError instanceof Error
           ? requestError.message
           : "No se pudo enviar el mensaje.";
       const spokenError = `Luffy tuvo un problema enviando tu mensaje. ${errorMessage}. Toca nuevamente para intentarlo.`;
@@ -798,9 +728,10 @@ export default function Home() {
         ...entries,
         newEntry("assistant", spokenError),
       ]);
-      await loadCurrentOrder(activeSession.id);
+      void loadCurrentOrder(activeSession.id);
       void speak(spokenError, { onEnd: () => setVoiceState("idle") });
     } finally {
+      window.clearTimeout(timeoutId);
       isSendingMessageRef.current = false;
       setIsSendingMessage(false);
     }
@@ -817,13 +748,11 @@ export default function Home() {
 
     setMessage("");
     unlockSpeechOutput();
-    stopRecognition();
     await sendChatMessage(cleanMessage);
   }
 
   async function runQuickAction(text: string) {
     unlockSpeechOutput();
-    stopRecognition();
     let activeSession = session;
 
     if (!activeSession) {
@@ -837,31 +766,278 @@ export default function Home() {
     await sendChatMessage(text, activeSession);
   }
 
-  function handleMicError(errorCode: string) {
-    lastMicErrorRef.current = errorCode;
-    setLastRecognitionError(errorCode);
-    setVoiceState("error");
+  function cleanupAudioCapture(shouldUpdateState = true) {
+    if (maxRecordingTimeoutRef.current !== null) {
+      window.clearTimeout(maxRecordingTimeoutRef.current);
+      maxRecordingTimeoutRef.current = null;
+    }
 
-    if (errorCode === "aborted") {
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.ondataavailable = null;
+      mediaRecorderRef.current.onerror = null;
+      mediaRecorderRef.current.onstop = null;
+    }
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    mediaRecorderRef.current = null;
+    audioChunksRef.current = [];
+    isStartingAudioRef.current = false;
+    isStoppingAudioRef.current = false;
+    if (shouldUpdateState) {
+      setIsRecordingAudio(false);
+    }
+  }
+
+  function getAudioMimeType() {
+    return typeof MediaRecorder === "undefined"
+      ? null
+      : getPreferredAudioMimeType(MediaRecorder.isTypeSupported.bind(MediaRecorder));
+  }
+
+  function reportVoiceError(message: string) {
+    cleanupAudioCapture();
+    setVoiceState("idle");
+    setError(message);
+    setConversation((entries) => [
+      ...entries,
+      newEntry("assistant", message),
+    ]);
+    void speak(message, { onEnd: () => setVoiceState("idle") });
+  }
+
+  async function startAudioRecording(activeSession: Session) {
+    if (
+      isStartingAudioRef.current ||
+      mediaRecorderRef.current?.state === "recording" ||
+      activeVoiceRequestRef.current
+    ) {
+      return;
+    }
+
+    if (!activeSession.id) {
+      reportVoiceError(noSessionForAudioMessage);
+      return;
+    }
+
+    if (!canUseMediaRecorder()) {
+      reportVoiceError(unsupportedMediaRecorderMessage);
+      return;
+    }
+
+    if (isSpeakingRef.current || isSpeechOutputActive()) {
+      setVoiceState("speaking");
+      return;
+    }
+
+    isStartingAudioRef.current = true;
+    setVoiceState("processing");
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      const mimeType = getAudioMimeType();
+
+      if (!mimeType) {
+        throw new DOMException(
+          "No hay un formato WebM compatible.",
+          "NotSupportedError",
+        );
+      }
+
+      const recorder = new MediaRecorder(stream, { mimeType });
+
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = recorder;
+      isStoppingAudioRef.current = false;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onerror = () => {
+        const message =
+          "Ocurrio un problema grabando el audio. Usa los botones rapidos o el modo prueba.";
+        reportVoiceError(message);
+      };
+
+      let hasHandledStop = false;
+      recorder.onstop = () => {
+        if (hasHandledStop) {
+          return;
+        }
+
+        hasHandledStop = true;
+        void finishAudioRecording(activeSession.id, recorder.mimeType || mimeType);
+      };
+
+      recorder.start();
+      maxRecordingTimeoutRef.current = window.setTimeout(() => {
+        if (mediaRecorderRef.current?.state === "recording") {
+          stopAudioRecording();
+        }
+      }, maximumVoiceRecordingDurationMs);
+      setIsRecordingAudio(true);
+      setHeardText("");
+      setError(null);
+      setVoiceState("listening");
+    } catch (recordingError) {
+      cleanupAudioCapture();
+      const permissionDenied =
+        recordingError instanceof DOMException &&
+        (recordingError.name === "NotAllowedError" ||
+          recordingError.name === "SecurityError");
+      const microphoneNotFound =
+        recordingError instanceof DOMException &&
+        (recordingError.name === "NotFoundError" ||
+          recordingError.name === "DevicesNotFoundError");
+      const unsupportedFormat =
+        recordingError instanceof DOMException &&
+        recordingError.name === "NotSupportedError";
+      const message = permissionDenied
+        ? noPermissionMessage
+        : microphoneNotFound
+          ? noAudioCaptureMessage
+          : unsupportedFormat
+            ? unsupportedMediaRecorderMessage
+            : "No pude iniciar la grabacion de audio. Usa los botones rapidos o el modo prueba.";
+
+      reportVoiceError(message);
+    } finally {
+      isStartingAudioRef.current = false;
+    }
+  }
+
+  function stopAudioRecording() {
+    const recorder = mediaRecorderRef.current;
+
+    if (isStoppingAudioRef.current) {
+      return;
+    }
+
+    if (!recorder || recorder.state === "inactive") {
+      cleanupAudioCapture();
       setVoiceState("idle");
       return;
     }
 
-    const message =
-      errorCode === "network"
-        ? recognitionNetworkMessage
-        : errorCode === "not-allowed" || errorCode === "service-not-allowed"
-        ? noPermissionMessage
-        : errorCode === "audio-capture"
-          ? noAudioCaptureMessage
-        : errorCode === "no-speech"
-          ? noVoiceMessage
-        : notUnderstoodMessage;
+    isStoppingAudioRef.current = true;
+    if (maxRecordingTimeoutRef.current !== null) {
+      window.clearTimeout(maxRecordingTimeoutRef.current);
+      maxRecordingTimeoutRef.current = null;
+    }
+    setIsRecordingAudio(false);
+    setVoiceState("processing");
+    setHeardText("");
+    try {
+      recorder.stop();
+    } catch {
+      reportVoiceError(
+        "No pude detener la grabacion. Toca nuevamente para intentarlo.",
+      );
+    }
+  }
 
-    setError(message);
+  async function finishAudioRecording(sessionId: string, mimeType: string) {
+    const chunks = [...audioChunksRef.current];
+    const audioMimeType = mimeType || "audio/webm";
+    cleanupAudioCapture();
+    const audioBlob = new Blob(chunks, { type: audioMimeType });
 
-    setConversation((entries) => [...entries, newEntry("assistant", message)]);
-    void speak(message, { onEnd: () => setVoiceState("idle") });
+    if (activeVoiceRequestRef.current) {
+      setVoiceState("idle");
+      return;
+    }
+
+    if (!sessionId) {
+      reportVoiceError(noSessionForAudioMessage);
+      return;
+    }
+
+    if (audioBlob.size === 0) {
+      const message =
+        "No se capturo audio. Toca nuevamente el microfono para intentarlo.";
+      reportVoiceError(message);
+      return;
+    }
+
+    const requestId = crypto.randomUUID();
+    const abortController = new AbortController();
+    let didTimeOut = false;
+    activeVoiceRequestRef.current = requestId;
+    voiceRequestAbortControllerRef.current = abortController;
+    isSendingMessageRef.current = true;
+    setIsSendingMessage(true);
+    setVoiceState("processing");
+
+    const formData = new FormData();
+    formData.append("sessionId", sessionId);
+    formData.append("audio", audioBlob, "pedido-voz.webm");
+    const timeoutId = window.setTimeout(() => {
+      didTimeOut = true;
+      abortController.abort();
+    }, voiceMessageTimeoutMs);
+
+    try {
+      const response = await fetch(`${apiUrl}${voiceMessageEndpoint}`, {
+        method: "POST",
+        body: formData,
+        signal: abortController.signal,
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => null);
+        throw new Error(getApiErrorMessage(errorBody, response.status));
+      }
+
+      const voiceResponse = (await response.json()) as VoiceMessageResponse;
+      const transcription = voiceResponse.transcription?.trim() ?? "";
+      const assistantMessage =
+        voiceResponse.assistantMessage?.trim() ||
+        "No recibi una respuesta del asistente.";
+
+      if (!transcription) {
+        throw new Error("No pude entender el audio. Intenta nuevamente.");
+      }
+
+      if ("order" in voiceResponse) {
+        setOrder(voiceResponse.order ?? null);
+        setOrderStatus(voiceResponse.order ? "" : "Sin pedido activo.");
+      } else {
+        await loadCurrentOrder(voiceResponse.sessionId || sessionId);
+      }
+
+      setError(null);
+      setHeardText(transcription);
+      setConversation((entries) => [
+        ...entries,
+        newEntry("user", transcription),
+        newEntry("assistant", assistantMessage),
+      ]);
+      void speak(assistantMessage, {
+        onEnd: () => setVoiceState("idle"),
+      });
+    } catch (sendError) {
+      const detail = didTimeOut
+        ? "La solicitud tardó más de 45 segundos. Intenta nuevamente."
+        : sendError instanceof TypeError
+          ? "No se pudo conectar con el servidor. Revisa tu conexión e intenta nuevamente."
+          : sendError instanceof Error
+            ? sendError.message
+            : "Ocurrió un error de red.";
+      reportVoiceError(`${audioSendErrorMessage} ${detail}`);
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (activeVoiceRequestRef.current === requestId) {
+        activeVoiceRequestRef.current = null;
+      }
+      if (voiceRequestAbortControllerRef.current === abortController) {
+        voiceRequestAbortControllerRef.current = null;
+      }
+      isSendingMessageRef.current = false;
+      setIsSendingMessage(false);
+    }
   }
 
   function isSpeechOutputActive() {
@@ -872,221 +1048,22 @@ export default function Home() {
     );
   }
 
-  async function prepareOnDeviceRecognition(
-    Recognition: SpeechRecognitionConstructor,
-    recognition: SpeechRecognitionLike,
-  ): Promise<boolean> {
-    if (!supportsOnDeviceSpeechRecognition(Recognition, recognition)) {
-      return true;
-    }
-
-    const options = createOnDeviceSpeechOptions();
-
-    try {
-      const availability = await Recognition.available!(options);
-
-      if (availability === "available") {
-        recognition.processLocally = true;
-        setLocalRecognitionMessage("");
-        return true;
-      }
-
-      if (
-        availability === "downloadable" ||
-        availability === "downloading"
-      ) {
-        setIsPreparingLocalRecognition(true);
-        setVoiceState("processing");
-        setLocalRecognitionMessage(
-          "Preparando reconocimiento de voz local...",
-        );
-
-        const installed = await Recognition.install!(options);
-
-        if (installed) {
-          setLocalRecognitionMessage(
-            "Reconocimiento local preparado. Toca nuevamente para hablar.",
-          );
-          setError(null);
-          setVoiceState("idle");
-        } else {
-          setLocalRecognitionMessage(
-            "No se pudo preparar el reconocimiento local. Intenta nuevamente o usa el modo texto.",
-          );
-          setVoiceState("error");
-        }
-
-        return false;
-      }
-
-      recognition.processLocally = false;
-      return true;
-    } catch {
-      recognition.processLocally = false;
-      return true;
-    } finally {
-      setIsPreparingLocalRecognition(false);
-    }
-  }
-
-  async function startRecognition(activeSession: Session) {
-    const Recognition = getRecognitionConstructor();
-
-    if (isListeningRef.current || recognitionRef.current) {
-      return;
-    }
-
-    if (isSpeakingRef.current || isSpeechOutputActive()) {
-      setVoiceState("speaking");
-      return;
-    }
-
-    if (!Recognition) {
-      setVoiceState("error");
-      setLastRecognitionError("unsupported");
-      setConversation((entries) => [
-        ...entries,
-        newEntry("assistant", unsupportedRecognitionMessage),
-      ]);
-      void speak(unsupportedRecognitionMessage, {
-        onEnd: () => setVoiceState("idle"),
-      });
-      return;
-    }
-
-    finalTranscriptRef.current = "";
-    lastMicErrorRef.current = null;
-    ignoreNextEndRef.current = false;
-    setHeardText("");
-
-    const recognition = new Recognition();
-    recognition.lang = "es-ES";
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 3;
-
-    const shouldStart = await prepareOnDeviceRecognition(
-      Recognition,
-      recognition,
-    );
-
-    if (!shouldStart) {
-      return;
-    }
-
-    recognition.onstart = () => {
-      isListeningRef.current = true;
-      setVoiceState("listening");
-    };
-
-    recognition.onresult = (event) => {
-      let interimText = "";
-      let finalText = "";
-
-      for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const result = event.results[index];
-        const transcript = result[0]?.transcript ?? "";
-
-        if (result.isFinal) {
-          finalText += transcript;
-        } else {
-          interimText += transcript;
-        }
-      }
-
-      const visibleText = `${finalText} ${interimText}`.trim();
-
-      if (visibleText) {
-        setHeardText(visibleText);
-      }
-
-      if (finalText.trim()) {
-        const browserRequest = createBrowserChatRequest(
-          activeSession.id,
-          finalText,
-        );
-
-        if (!browserRequest) {
-          return;
-        }
-
-        const recognizedText = browserRequest.body.message;
-        console.log(recognizedText);
-        finalTranscriptRef.current = recognizedText;
-        setHeardText(recognizedText);
-        ignoreNextEndRef.current = true;
-        isListeningRef.current = false;
-        recognition.stop();
-        void sendChatMessage(
-          recognizedText,
-          activeSession,
-          browserRequest.path,
-        );
-      }
-    };
-
-    recognition.onerror = (event) => {
-      ignoreNextEndRef.current = true;
-      isListeningRef.current = false;
-      recognition.onstart = null;
-      recognition.onresult = null;
-      recognition.onerror = null;
-      recognition.onend = null;
-      recognitionRef.current = null;
-      try {
-        recognition.abort();
-      } catch {}
-      handleMicError(event.error);
-    };
-
-    recognition.onend = () => {
-      recognitionRef.current = null;
-      isListeningRef.current = false;
-
-      if (ignoreNextEndRef.current || lastMicErrorRef.current) {
-        ignoreNextEndRef.current = false;
-        return;
-      }
-
-      if (!finalTranscriptRef.current.trim()) {
-        if (isSendingMessageRef.current) {
-          return;
-        }
-
-        setVoiceState("idle");
-        setConversation((entries) => [
-          ...entries,
-          newEntry("assistant", noVoiceMessage),
-        ]);
-        void speak(`${noVoiceMessage} ${micOffMessage}`, {
-          onEnd: () => setVoiceState("idle"),
-        });
-        return;
-      }
-
-      setVoiceState("idle");
-    };
-
-    recognitionRef.current = recognition;
-
-    try {
-      recognition.start();
-    } catch {
-      recognitionRef.current = null;
-      handleMicError("start-failed");
-    }
-  }
-
   async function handleMainTouch() {
     unlockSpeechOutput();
     void loadVoices();
 
+    if (mediaRecorderRef.current?.state === "recording") {
+      stopAudioRecording();
+      return;
+    }
+
     if (isSpeakingRef.current || isSpeechOutputActive()) {
+      console.log("Microfono bloqueado: Luffy esta hablando.");
       setVoiceState("speaking");
       return;
     }
 
-    if (isMicDisabled || isListeningRef.current) {
+    if (isMicDisabled) {
       return;
     }
 
@@ -1102,10 +1079,7 @@ export default function Home() {
       return;
     }
 
-    if (shouldUseBrowserRecognition(voiceMode)) {
-      await startRecognition(activeSession);
-      return;
-    }
+    await startAudioRecording(activeSession);
   }
 
   return (
@@ -1179,7 +1153,11 @@ export default function Home() {
               type="button"
               onClick={() => void handleMainTouch()}
               disabled={isMicDisabled}
-              aria-label="Toca para hablar con Luffy"
+              aria-label={
+                voiceState === "listening"
+                  ? "Detener grabacion y enviar el pedido a Luffy"
+                  : "Toca para hablar con Luffy"
+              }
               className="relative flex flex-1 flex-col items-center justify-center overflow-hidden rounded-md border border-emerald-300/40 bg-black px-5 py-8 text-center outline-none transition hover:border-emerald-200 focus-visible:ring-4 focus-visible:ring-emerald-300 disabled:cursor-wait disabled:border-white/15"
             >
               {voiceState === "listening" ? (
@@ -1225,16 +1203,6 @@ export default function Home() {
               <p className="relative mt-5 max-w-3xl text-2xl leading-10 text-neutral-200">
                 {currentVoiceStatus.helper}
               </p>
-
-              {localRecognitionMessage ? (
-                <p
-                  role="status"
-                  aria-live="polite"
-                  className="relative mt-6 max-w-3xl rounded-md border border-sky-300/40 bg-neutral-950/90 px-5 py-4 text-2xl text-sky-100"
-                >
-                  {localRecognitionMessage}
-                </p>
-              ) : null}
 
               {heardText ? (
                 <p className="relative mt-6 max-w-3xl rounded-md border border-emerald-300/40 bg-neutral-950/90 px-5 py-4 text-2xl text-emerald-100">
@@ -1291,16 +1259,14 @@ export default function Home() {
                   Voz seleccionada: {selectedVoiceLabel}
                 </p>
                 <p className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
-                  <span className="block text-sm uppercase text-neutral-500">
-                    Idioma de reconocimiento
-                  </span>
-                  <span className="mt-2 block text-lg text-white">es-ES</span>
+                  Endpoint de voz: {voiceMessageEndpoint}
                 </p>
                 <p className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
-                  Ultimo error SpeechRecognition: {lastRecognitionError}
+                  Grabacion real:{" "}
+                  {mediaRecorderSupported ? "disponible" : "no disponible"}
                 </p>
                 <p className="rounded-md border border-white/10 bg-black px-4 py-3 text-base text-neutral-300">
-                  Modo de voz: {voiceMode}
+                  Limite de grabacion: 15 segundos
                 </p>
               </div>
               <form
@@ -1329,13 +1295,6 @@ export default function Home() {
                 </button>
               </form>
             </div>
-          ) : null}
-
-          {clientReady && voiceMode === "browser" && !speechSupported ? (
-            <p className="mt-4 rounded-md border border-yellow-300/50 bg-yellow-950 px-4 py-3 text-lg text-yellow-100">
-              SpeechRecognition no esta disponible en este navegador. Usa
-              Chrome o Edge, o abre Modo prueba.
-            </p>
           ) : null}
         </section>
       </div>
